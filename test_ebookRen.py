@@ -127,6 +127,15 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.volume, (3, "00"))
         self.assertEqual(record.title, "Dom płomienia i cienia")
 
+    def test_infer_record_handles_compact_series_volume_title_with_trailing_author(self) -> None:
+        stem = "Ksiezycowe Miasto-01.Dom Ziemi - Sarah J. Maas"
+        meta = make_meta(stem)
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+        self.assertEqual(record.author, "Maas Sarah J.")
+        self.assertEqual(record.series, "Ksiezycowe Miasto")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.title, "Dom Ziemi")
+
     def test_google_books_candidates_returns_empty_list_when_no_query_can_be_built(self) -> None:
         meta = make_meta("", title="", creators=[], identifiers=[])
         self.assertEqual(kod_v3.google_books_candidates(meta, 2.0), [])

@@ -96,6 +96,7 @@ CORE_COMMA_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})\s*,\s*(.+)$", re
 CORE_JOINED_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})\s*[-_:]\s*(.+)$", re.IGNORECASE)
 CORE_SPACED_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})\s+(.+)$", re.IGNORECASE)
 CORE_INDEX_ONLY_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})$", re.IGNORECASE)
+CORE_TITLE_AUTHOR_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})\s+(.+?)\s+-\s+(.+)$", re.IGNORECASE)
 SEGMENT_HASH_RE = re.compile(rf"(.+?)\s*#\s*({VOLUME_INDEX_PATTERN})\b", re.IGNORECASE)
 SEGMENT_COMMA_RE = re.compile(rf"^([^,]{{3,}}?),\s*({VOLUME_INDEX_PATTERN})\s*(?:,|$)", re.IGNORECASE)
 SEGMENT_YEAR_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})\s*,\s*\d{{4}}\b", re.IGNORECASE)
@@ -1160,6 +1161,11 @@ def source_needs_online_verification(source: str) -> bool:
 
 def extract_trailing_author_from_core(text: str) -> str:
     value = strip_source_artifacts(text)
+    if " - " in value:
+        _, _, trailing = value.rpartition(" - ")
+        trailing = clean_author_segment(trailing)
+        if looks_like_author_segment(trailing):
+            return trailing
     parts = value.split()
     if len(parts) < 2:
         return ""
@@ -1190,7 +1196,7 @@ def extract_trailing_author_from_core(text: str) -> str:
         if not looks_like_author_segment(candidate):
             continue
         name_parts = candidate.split()
-        if size == 3 and name_parts[1].lower() not in surname_particles:
+        if size == 3 and name_parts[1].lower() not in surname_particles and not re.fullmatch(r"[A-Za-z]\.?", name_parts[1]):
             continue
         if any(token.lower() in blocked_tokens for token in name_parts):
             continue
@@ -1379,6 +1385,17 @@ def collect_core_candidates(core: str, candidates: list[Candidate]) -> None:
             90,
             "core:paren-series",
             match.group(1),
+        )
+
+    match = CORE_TITLE_AUTHOR_RE.match(core)
+    if match and looks_like_author_segment(match.group(4)) and not re.match(r"^\d+\b", clean(match.group(3))):
+        add_candidate(
+            candidates,
+            match.group(1),
+            parse_volume_parts(match.group(2)),
+            91,
+            "core:title-author",
+            match.group(3),
         )
 
     match = CORE_COMMA_RE.match(core)
