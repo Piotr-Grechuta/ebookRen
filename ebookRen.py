@@ -313,6 +313,7 @@ def strip_source_artifacts(text: str | None) -> str:
         return ""
     value = SOURCE_ARTIFACT_RE.sub("", value)
     value = HEX_NOISE_RE.sub("", value)
+    value = re.sub(r"\s*\(\d+\)\s*$", "", value)
     return clean(value)
 
 
@@ -1482,8 +1483,14 @@ def is_series_volume_only_title(title: str, series: str, volume: tuple[int, str]
 
 def strip_author_from_title(title: str, author: str) -> str:
     title = clean(title)
-    if not title or not author:
+    if not title:
         return title
+    if " - " in title:
+        left, _, right = title.partition(" - ")
+        if looks_like_author_segment(left):
+            title = right
+    if not author:
+        return clean(title)
     for token in [part.strip() for part in author.split("&") if part.strip()]:
         names = [name for name in clean(token).split() if len(name) > 1]
         if len(names) < 2:

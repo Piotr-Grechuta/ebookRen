@@ -176,6 +176,18 @@ class KodV3Tests(unittest.TestCase):
         self.assertTrue(any("Plamann Cale" in " | ".join(variant.creators) or "Cale Plamann" in " | ".join(variant.creators) for variant in variants))
         self.assertTrue(any(variant.title == "A Dream of Wings & Flame A LitRPG Adventure" for variant in variants))
 
+    def test_strip_source_artifacts_removes_numeric_suffix(self) -> None:
+        self.assertEqual(kod_v3.strip_source_artifacts("Title - libgen.li (1)"), "Title")
+
+    def test_strip_author_from_title_removes_prefixed_author_without_known_author_field(self) -> None:
+        self.assertEqual(
+            kod_v3.strip_author_from_title(
+                "Cale Plamann - A Dream of Wings & Flame A LitRPG Adventure",
+                "",
+            ),
+            "A Dream of Wings & Flame A LitRPG Adventure",
+        )
+
     def test_father_of_constructs_source_prefers_series_over_publisher(self) -> None:
         stem = (
             "Father of Constructs 03 The Eldritch Artisan_ Father of Constructs_ Book 3 (LitRPG) -- "
