@@ -347,13 +347,15 @@ class KodV3Tests(unittest.TestCase):
             self.assertEqual(plan.moves[0].source.name, " Target-.epub ")
             self.assertEqual(plan.moves[0].destination.name, " Book-.epub ")
 
-    def test_review_required_records_are_not_renamed_in_apply_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp)
-            source = folder / "A Touch of Power Omnibus -- Jay Boyce.epub"
+    def test_review_required_records_are_processed_in_apply_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as src_tmp, tempfile.TemporaryDirectory() as dst_tmp:
+            source_folder = Path(src_tmp)
+            destination_folder = Path(dst_tmp)
+            source = source_folder / "A Touch of Power Omnibus -- Jay Boyce.epub"
             source.touch()
             code, lines = kod_v3.run_job(
-                folder,
+                source_folder,
+                destination_folder=destination_folder,
                 apply_changes=True,
                 use_online=False,
                 providers=[],
@@ -361,7 +363,14 @@ class KodV3Tests(unittest.TestCase):
                 limit=0,
             )
             self.assertEqual(code, 0)
-            self.assertIn("TO_WRITE=0", lines)
+            self.assertTrue(any("TO_WRITE=1" in line for line in lines))
+            self.assertTrue(any("WRITTEN=1" in line for line in lines))
+            report_line = next(line for line in lines if line.startswith("REPORT="))
+            report_path = Path(report_line.split("=", 1)[1])
+            with report_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle, delimiter=";"))
+            self.assertEqual(rows[0]["review"], "CHECK")
+            self.assertEqual(rows[0]["execution_status"], "copied")
             self.assertTrue(source.exists())
 
     def test_apply_report_contains_actual_execution_status(self) -> None:

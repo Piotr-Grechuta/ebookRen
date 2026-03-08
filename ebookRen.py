@@ -1722,8 +1722,6 @@ def build_moves(records: list[BookRecord], source_folder: Path, target_folder: P
     moves: list[RenameMove] = []
     same_folder = source_folder.resolve() == target_folder.resolve()
     for index, record in enumerate(records, start=1):
-        if record.needs_review:
-            continue
         destination = target_folder / record.filename
         if record.path.parent.resolve() == destination.parent.resolve() and record.path.name == destination.name:
             continue
@@ -2078,17 +2076,13 @@ def run_job(
     execution_status: dict[Path, str] = {}
     if dry_run:
         for record in records:
-            if record.needs_review:
-                execution_status[record.path.resolve()] = "review-required"
-            elif operation == "rename" and record.path.name == record.filename:
+            if operation == "rename" and record.path.name == record.filename:
                 execution_status[record.path.resolve()] = "unchanged"
             else:
                 execution_status[record.path.resolve()] = "planned"
     else:
         for record in records:
-            if record.needs_review:
-                execution_status[record.path.resolve()] = "skipped-review"
-            elif operation == "rename" and record.path.name == record.filename:
+            if operation == "rename" and record.path.name == record.filename:
                 execution_status[record.path.resolve()] = "unchanged"
             else:
                 execution_status[record.path.resolve()] = "pending"
@@ -2105,9 +2099,11 @@ def run_job(
             execution_status=execution_status,
         )
         review_count = sum(1 for record in records if record.needs_review)
+        lines.append(
+            f"TOTAL={len(records)} | REVIEW={review_count} | TO_WRITE={len(build_moves(records, folder, target_folder, stamp))}"
+        )
         lines.extend(
             [
-                f"TOTAL={len(records)}",
                 "MODE=DRY-RUN",
                 f"OPERATION={operation.upper()}",
                 f"SOURCE={folder}",
@@ -2152,17 +2148,21 @@ def run_job(
         operation=operation,
         execution_status=execution_status,
     )
+    review_total = sum(1 for record in records if record.needs_review)
+    written_total = len(moves) if not errors else 0
+    lines.append(
+        f"TOTAL={len(records)} | TO_WRITE={len(moves)} | WRITTEN={written_total} | REVIEW={review_total} | ERRORS={len(errors)}"
+    )
     lines.extend(
         [
-            f"TOTAL={len(records)}",
             f"OPERATION={operation.upper()}",
             f"SOURCE={folder}",
             f"DESTINATION={target_folder}",
             f"INFER_WORKERS={infer_workers}",
             f"ONLINE_HTTP_SLOTS={ONLINE_HTTP_SLOTS}",
             f"TO_WRITE={len(moves)}",
-            f"WRITTEN={len(moves) if not errors else 0}",
-            f"REVIEW={sum(1 for record in records if record.needs_review)}",
+            f"WRITTEN={written_total}",
+            f"REVIEW={review_total}",
             f"ERRORS={len(errors)}",
             f"REPORT={report_path}",
         ]
