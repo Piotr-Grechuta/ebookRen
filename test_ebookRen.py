@@ -308,6 +308,60 @@ class KodV3Tests(unittest.TestCase):
         self.assertNotIn("uzupelnione-online", record.review_reasons)
         self.assertEqual(record.confidence, offline.confidence)
 
+    def test_validate_record_components_with_online_reassigns_fields_by_role(self) -> None:
+        meta = make_meta("Ksiezycowe Miasto-01.Dom Ziemi - Sarah J. Maas")
+        local_candidates: list[kod_v3.Candidate] = []
+        kod_v3.add_candidate(local_candidates, "Ksiezycowe Miasto", (1, "00"), 91, "core:title-author", "Dom Ziemi")
+        record = kod_v3.BookRecord(
+            path=meta.path,
+            author="Nieznany Autor",
+            series="Standalone",
+            volume=None,
+            title="Sarah J. Maas",
+            source="core:spaced",
+            identifiers=[],
+            notes=[],
+            confidence=50,
+            review_reasons=[],
+            decision_reasons=[],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "google-books",
+                "google-books",
+                "Dom Ziemi",
+                ["Sarah J. Maas"],
+                [],
+                230,
+                "title-author-exact",
+            ),
+            kod_v3.OnlineCandidate(
+                "google-books",
+                "google-books",
+                "Dom Ziemi: Ksiezycowe Miasto, Book 1",
+                ["Sarah J. Maas"],
+                [],
+                220,
+                "title-author-exact",
+            )
+        ]
+        verification = kod_v3.OnlineVerification(True, False, False, False, False, ["google-books"])
+        verification = kod_v3.validate_record_components_with_online(
+            record,
+            meta,
+            local_candidates,
+            online_candidates,
+            verification,
+        )
+        self.assertEqual(record.author, "Maas Sarah J")
+        self.assertEqual(record.series, "Ksiezycowe Miasto")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.title, "Dom Ziemi")
+        self.assertTrue(verification.author_confirmed)
+        self.assertTrue(verification.series_confirmed)
+        self.assertTrue(verification.volume_confirmed)
+        self.assertTrue(verification.title_confirmed)
+
     def test_online_applied_does_not_force_review(self) -> None:
         meta = make_meta("Series 1: Title", creators=["Known Author"])
         record = kod_v3.BookRecord(

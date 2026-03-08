@@ -263,6 +263,14 @@ class OnlineVerification:
     providers: list[str]
 
 
+@dataclass(frozen=True)
+class OnlineRoleEvidence:
+    authors: dict[str, str]
+    titles: dict[str, str]
+    series: dict[str, str]
+    volumes: set[tuple[int, str]]
+
+
 SERIES_SOURCE_PRIORITIES = {
     "opf": 140,
     "title:series-book": 136,
@@ -478,6 +486,83 @@ def cache_online_error(cache_key: str, message: str) -> None:
 
 def online_cache_key(kind: str, url: str) -> str:
     return f"{kind}:{url}"
+
+
+def is_strong_online_candidate(candidate: object) -> bool:
+    return bool(
+        is_online_candidate(candidate)
+        and candidate.provider != "lubimyczytac"
+        and candidate.score >= 150
+        and "approx" not in candidate.reason
+        and "ambiguous" not in candidate.reason
+    )
+
+
+def register_online_role_text(bucket: dict[str, str], text: str | None, *, author_role: bool = False) -> None:
+    label = clean_author_segment(text) if author_role else clean(text)
+    if not label:
+        return
+    key = author_key(label) if author_role else normalize_match_text(label)
+    if key and key not in bucket:
+        bucket[key] = label
+
+
+def collect_online_role_evidence(candidates: list[OnlineCandidate]) -> OnlineRoleEvidence:
+    authors: dict[str, str] = {}
+    titles: dict[str, str] = {}
+    series: dict[str, str] = {}
+    volumes: set[tuple[int, str]] = set()
+
+    for candidate in candidates:
+        if not is_strong_online_candidate(candidate):
+            continue
+        for author in canonicalize_authors(candidate.authors):
+            register_online_role_text(authors, author, author_role=True)
+        register_online_role_text(titles, candidate.title)
+
+        parsed_candidates: list[Candidate] = []
+        collect_title_candidates(candidate.title, parsed_candidates)
+        collect_core_candidates(candidate.title, parsed_candidates)
+        best_series = choose_series_candidate(parsed_candidates)
+        best_title = choose_title_candidate(parsed_candidates)
+        if best_series is not None:
+            register_online_role_text(series, best_series.series)
+            if best_series.volume is not None:
+                volumes.add(best_series.volume)
+        if best_title is not None and best_title.title_override:
+            register_online_role_text(titles, best_title.title_override)
+
+    return OnlineRoleEvidence(authors, titles, series, volumes)
+
+
+def best_matching_online_text(
+    values: Iterable[str],
+    evidence: dict[str, str],
+    *,
+    author_role: bool = False,
+    threshold: float = 0.92,
+) -> str | None:
+    best_label = ""
+    best_score = 0.0
+    for value in values:
+        label = clean_author_segment(value) if author_role else clean(value)
+        if not label:
+            continue
+        if author_role:
+            value_keys = author_match_keys([label])
+            for evidence_label in evidence.values():
+                if value_keys.intersection(author_match_keys([evidence_label])):
+                    return evidence_label
+        else:
+            key = normalize_match_text(label)
+            if key and key in evidence:
+                return evidence[key]
+        for evidence_label in evidence.values():
+            score = similarity_score(label, evidence_label)
+            if score >= threshold and score > best_score:
+                best_label = evidence_label
+                best_score = score
+    return best_label or None
 
 
 def online_fetch(url: str, timeout: float, *, kind: str) -> object | None:
@@ -1095,6 +1180,90 @@ def verify_record_against_online(record: BookRecord, candidates: list[OnlineCand
             break
 
     return OnlineVerification(True, author_confirmed, title_confirmed, series_confirmed, volume_confirmed, providers)
+
+
+def validate_record_components_with_online(
+    record: BookRecord,
+    meta: EpubMetadata,
+    local_candidates: list[Candidate],
+    online_candidates: list[OnlineCandidate],
+    verification: OnlineVerification,
+) -> OnlineVerification:
+    evidence = collect_online_role_evidence(online_candidates)
+    if not any([evidence.authors, evidence.titles, evidence.series, evidence.volumes]):
+        return verification
+
+    author_confirmed = verification.author_confirmed
+    title_confirmed = verification.title_confirmed
+    series_confirmed = verification.series_confirmed
+    volume_confirmed = verification.volume_confirmed
+
+    author_fragments: list[str] = [record.author]
+    author_fragments.extend(meta.creators)
+    author_fragments.append(extract_trailing_author_from_core(meta.core))
+    author_fragments.extend(part for part in re.split(r"\s+-\s+", meta.core) if part)
+
+    matched_author = None if author_confirmed else best_matching_online_text(author_fragments, evidence.authors, author_role=True, threshold=0.9)
+    if matched_author:
+        canonical_author = matched_author
+        if canonical_author and canonical_author != record.author:
+            record.author = canonical_author
+            record.notes.append("online-role-author:applied")
+            record.decision_reasons.append("online-role-author:yes")
+            record.online_applied = True
+        author_confirmed = True
+
+    if not series_confirmed and evidence.series:
+        for candidate in sorted(local_candidates, key=series_candidate_priority, reverse=True):
+            matched_series = best_matching_online_text([candidate.series], evidence.series, threshold=0.9)
+            if not matched_series:
+                continue
+            cleaned_series = clean_series(matched_series)
+            if cleaned_series and cleaned_series != record.series:
+                record.series = cleaned_series
+                record.notes.append("online-role-series:applied")
+                record.decision_reasons.append("online-role-series:yes")
+                record.online_applied = True
+            series_confirmed = True
+            if not volume_confirmed and candidate.volume in evidence.volumes:
+                record.volume = candidate.volume
+                volume_confirmed = True
+            break
+
+    if not title_confirmed and evidence.titles:
+        local_title_candidates = [candidate.title_override for candidate in local_candidates if candidate.title_override]
+        local_title_candidates.extend([record.title, meta.title, sanitize_title(meta.core, record.series, record.volume)])
+        matched_title = best_matching_online_text(local_title_candidates, evidence.titles, threshold=0.88)
+        if matched_title:
+            cleaned_title = sanitize_title(matched_title, record.series, record.volume) or clean(matched_title)
+            if cleaned_title and cleaned_title != record.title:
+                record.title = cleaned_title
+                record.notes.append("online-role-title:applied")
+                record.decision_reasons.append("online-role-title:yes")
+                record.online_applied = True
+            title_confirmed = True
+
+    if not volume_confirmed and evidence.volumes:
+        if record.volume in evidence.volumes:
+            volume_confirmed = True
+        else:
+            for candidate in sorted(local_candidates, key=series_candidate_priority, reverse=True):
+                if candidate.volume in evidence.volumes:
+                    record.volume = candidate.volume
+                    volume_confirmed = True
+                    record.notes.append("online-role-volume:applied")
+                    record.decision_reasons.append("online-role-volume:yes")
+                    record.online_applied = True
+                    break
+
+    return OnlineVerification(
+        verification.checked,
+        author_confirmed,
+        title_confirmed,
+        series_confirmed,
+        volume_confirmed,
+        verification.providers,
+    )
 
 
 def parse_existing_filename(stem: str) -> tuple[str, str, tuple[int, str] | None, str] | None:
@@ -1996,6 +2165,7 @@ def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], tim
 
     if use_online:
         verification = verify_record_against_online(record, online_candidates)
+        verification = validate_record_components_with_online(record, meta, candidates, online_candidates, verification)
         if verification.checked:
             provider_text = ",".join(verification.providers)
             record.notes.append(f"online-verify:{provider_text}")
