@@ -292,6 +292,9 @@ PROVIDER_SCORE_ADJUSTMENTS = {
 def clean(text: str | None) -> str:
     if not text:
         return ""
+    text = re.sub(r"([^\W\d_])[-_](\d{1,3})\.(?=[^\W\d_])", r"\1 \2 ", text, flags=re.UNICODE)
+    text = re.sub(r"([^\W\d_])[-_](\d{1,3})(?=[-_:])", r"\1 \2 ", text, flags=re.UNICODE)
+    text = re.sub(r"(\d{1,3})\.(?=[^\W\d_])", r"\1 ", text, flags=re.UNICODE)
     text = text.replace("_", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text.strip(" .-")
@@ -627,6 +630,8 @@ def parse_volume_parts(text: str | None) -> tuple[int, str] | None:
         major = int(match.group(1))
         minor = (match.group(2) or "00").zfill(2)
         return major, minor
+    if re.fullmatch(r"[IVXLCDM]", token, flags=re.IGNORECASE):
+        return None
     roman_value = roman_to_int(token)
     if roman_value is not None:
         return roman_value, "00"

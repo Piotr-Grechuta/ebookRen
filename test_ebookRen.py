@@ -109,6 +109,24 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(kod_v3.normalize_match_text("Żmijewski"), "zmijewski")
         self.assertEqual(kod_v3.author_key("Łukasz Żmijewski"), "lukaszzmijewski")
 
+    def test_clean_normalizes_compact_series_volume_title_pattern(self) -> None:
+        self.assertEqual(
+            kod_v3.clean("Księżycowe Miasto-03.Dom płomienia i cienia"),
+            "Księżycowe Miasto 03 Dom płomienia i cienia",
+        )
+
+    def test_parse_volume_parts_does_not_treat_single_letter_i_as_roman_volume(self) -> None:
+        self.assertIsNone(kod_v3.parse_volume_parts("i"))
+
+    def test_infer_record_handles_compact_series_volume_title_pattern(self) -> None:
+        stem = "Księżycowe Miasto-03.Dom płomienia i cienia -- Maas, Sarah J"
+        meta = make_meta(stem, creators=["Maas, Sarah J"])
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+        self.assertEqual(record.author, "Maas Sarah J")
+        self.assertEqual(record.series, "Księżycowe Miasto")
+        self.assertEqual(record.volume, (3, "00"))
+        self.assertEqual(record.title, "Dom płomienia i cienia")
+
     def test_google_books_candidates_returns_empty_list_when_no_query_can_be_built(self) -> None:
         meta = make_meta("", title="", creators=[], identifiers=[])
         self.assertEqual(kod_v3.google_books_candidates(meta, 2.0), [])
@@ -262,7 +280,18 @@ class KodV3Tests(unittest.TestCase):
             decision_reasons=["online-candidate:google-books"],
             online_checked=True,
         )
-        with mock.patch.object(kod_v3, "enrich_from_online", return_value=online):
+        fake_candidate = kod_v3.OnlineCandidate(
+            "google-books",
+            "google-books",
+            "Mystery Book",
+            ["Test Author"],
+            [],
+            300,
+            "title-author-exact",
+        )
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=[fake_candidate]), \
+             mock.patch.object(kod_v3, "pick_best_online_match", return_value=fake_candidate), \
+             mock.patch.object(kod_v3, "build_online_record", return_value=online):
             record = kod_v3.infer_record(meta, use_online=True, providers=["google"], timeout=1.0)
         self.assertTrue(record.online_checked)
         self.assertFalse(record.online_applied)
