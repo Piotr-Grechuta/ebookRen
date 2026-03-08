@@ -1328,6 +1328,15 @@ def source_needs_online_verification(source: str) -> bool:
     return source.startswith("core:") or source.startswith("segment:")
 
 
+def existing_format_needs_online_verification(record: BookRecord) -> bool:
+    return (
+        record.author == "Nieznany Autor"
+        or record.series == "Standalone"
+        or record.volume is None
+        or record.volume == (0, "00")
+    )
+
+
 def extract_trailing_author_from_core(text: str) -> str:
     value = strip_source_artifacts(text)
     if " - " in value:
@@ -2009,6 +2018,9 @@ def finalize_record_quality(record: BookRecord, meta: EpubMetadata, base_confide
 
 def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], timeout: float) -> BookRecord:
     existing = parse_existing_filename(meta.stem)
+    candidates: list[Candidate] = []
+    author_from_trailing_core = False
+    title_from_core = False
     if existing is not None:
         author, series, volume, title = existing
         record = BookRecord(
@@ -2024,80 +2036,82 @@ def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], tim
             review_reasons=[],
             decision_reasons=["existing-format"],
         )
-        return finalize_record_quality(record, meta, 100, title_from_core=False)
-
-    segment_author = ""
-    author_from_trailing_core = False
-    if len(meta.segments) > 1:
-        second = clean_author_segment(meta.segments[1])
-        if looks_like_author_segment(second):
-            segment_author = second
-    if not segment_author and not meta.creators:
-        segment_author = extract_trailing_author_from_core(meta.core)
-        author_from_trailing_core = bool(segment_author)
-
-    author = extract_authors(meta.creators, segment_author)
-    candidates: list[Candidate] = []
-
-    if meta.meta_series:
-        add_candidate(candidates, meta.meta_series, meta.meta_volume, 100, "opf")
-    collect_title_candidates(meta.title, candidates)
-    collect_core_candidates(meta.core, candidates)
-    collect_segment_candidates(meta.segments, candidates)
-
-    if candidates:
-        best_series = choose_series_candidate(candidates)
-        best_title = choose_title_candidate(candidates)
-        assert best_series is not None
-        series = best_series.series
-        volume = best_series.volume
-        title_override = best_title.title_override if best_title else best_series.title_override
-        source_parts = [best_series.source]
-        if best_title and best_title.source not in source_parts:
-            source_parts.append(best_title.source)
-        source = "+".join(source_parts)
-        base_confidence = max(
-            best_series.score,
-            best_title.score if best_title else 0,
-        )
+        if not (use_online and existing_format_needs_online_verification(record)):
+            return finalize_record_quality(record, meta, 100, title_from_core=False)
+        if record.series and record.series != "Standalone":
+            add_candidate(candidates, record.series, record.volume, 100, "existing-format", record.title)
+        base_confidence = 100
     else:
-        series = "Standalone"
-        volume = None
-        title_override = None
-        source = "fallback"
-        base_confidence = 45
+        segment_author = ""
+        if len(meta.segments) > 1:
+            second = clean_author_segment(meta.segments[1])
+            if looks_like_author_segment(second):
+                segment_author = second
+        if not segment_author and not meta.creators:
+            segment_author = extract_trailing_author_from_core(meta.core)
+            author_from_trailing_core = bool(segment_author)
 
-    local_title = sanitize_title(meta.title, series, volume)
-    title = title_override or local_title or clean(meta.core)
-    title_from_core = not bool(title_override or local_title)
-    if local_title and title_override:
-        if len(title_override) > len(local_title) + 12 or HEX_NOISE_RE.search(title_override) or ANNA_ARCHIVE_RE.search(title_override):
-            title = local_title
-            title_from_core = False
+        author = extract_authors(meta.creators, segment_author)
 
-    title = strip_author_from_title(title, author)
-    title = clean(ANNA_ARCHIVE_RE.sub("", title))
-    title = sanitize_title(title, series, volume)
-    notes = list(meta.errors)
+        if meta.meta_series:
+            add_candidate(candidates, meta.meta_series, meta.meta_volume, 100, "opf")
+        collect_title_candidates(meta.title, candidates)
+        collect_core_candidates(meta.core, candidates)
+        collect_segment_candidates(meta.segments, candidates)
 
-    record = BookRecord(
-        path=meta.path,
-        author=author,
-        series=clean_series(series) or "Standalone",
-        volume=volume,
-        title=title,
-        source=source,
-        identifiers=extract_isbns(meta.identifiers),
-        notes=notes,
-        confidence=base_confidence,
-        review_reasons=[],
-        decision_reasons=[f"inference:{source}"],
-    )
+        if candidates:
+            best_series = choose_series_candidate(candidates)
+            best_title = choose_title_candidate(candidates)
+            assert best_series is not None
+            series = best_series.series
+            volume = best_series.volume
+            title_override = best_title.title_override if best_title else best_series.title_override
+            source_parts = [best_series.source]
+            if best_title and best_title.source not in source_parts:
+                source_parts.append(best_title.source)
+            source = "+".join(source_parts)
+            base_confidence = max(
+                best_series.score,
+                best_title.score if best_title else 0,
+            )
+        else:
+            series = "Standalone"
+            volume = None
+            title_override = None
+            source = "fallback"
+            base_confidence = 45
 
+        local_title = sanitize_title(meta.title, series, volume)
+        title = title_override or local_title or clean(meta.core)
+        title_from_core = not bool(title_override or local_title)
+        if local_title and title_override:
+            if len(title_override) > len(local_title) + 12 or HEX_NOISE_RE.search(title_override) or ANNA_ARCHIVE_RE.search(title_override):
+                title = local_title
+                title_from_core = False
+
+        title = strip_author_from_title(title, author)
+        title = clean(ANNA_ARCHIVE_RE.sub("", title))
+        title = sanitize_title(title, series, volume)
+        notes = list(meta.errors)
+
+        record = BookRecord(
+            path=meta.path,
+            author=author,
+            series=clean_series(series) or "Standalone",
+            volume=volume,
+            title=title,
+            source=source,
+            identifiers=extract_isbns(meta.identifiers),
+            notes=notes,
+            confidence=base_confidence,
+            review_reasons=[],
+            decision_reasons=[f"inference:{source}"],
+        )
     online_candidates: list[OnlineCandidate] = []
     if use_online and (
         record.series == "Standalone"
         or record.volume is None
+        or record.volume == (0, "00")
         or record.author == "Nieznany Autor"
         or source_needs_online_verification(record.source)
     ):
@@ -2150,6 +2164,7 @@ def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], tim
                                 online_applied = True
                         if best_online_series and (
                             record.volume is None
+                            or record.volume == (0, "00")
                             or record.source.startswith("core:spaced")
                             or record.source.startswith("core:index-only")
                         ):

@@ -362,6 +362,25 @@ class KodV3Tests(unittest.TestCase):
         self.assertTrue(verification.volume_confirmed)
         self.assertTrue(verification.title_confirmed)
 
+    def test_existing_format_with_standalone_and_zero_volume_still_allows_online_series_upgrade(self) -> None:
+        meta = make_meta("Carter Rachel E - Standalone - Tom 00.00 - 01. Pierwszy rok")
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "google-books",
+                "google-books",
+                "First Year: The Black Mage, Book 1",
+                ["Rachel E. Carter"],
+                [],
+                230,
+                "title-author-exact",
+            )
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["google"], timeout=1.0)
+        self.assertEqual(record.author, "Carter Rachel E")
+        self.assertEqual(record.series, "The Black Mage")
+        self.assertEqual(record.volume, (1, "00"))
+
     def test_online_applied_does_not_force_review(self) -> None:
         meta = make_meta("Series 1: Title", creators=["Known Author"])
         record = kod_v3.BookRecord(
