@@ -251,6 +251,16 @@ class OnlineCandidate:
     reason: str
 
 
+@dataclass(frozen=True)
+class OnlineVerification:
+    checked: bool
+    author_confirmed: bool
+    title_confirmed: bool
+    series_confirmed: bool
+    volume_confirmed: bool
+    providers: list[str]
+
+
 SERIES_SOURCE_PRIORITIES = {
     "opf": 140,
     "title:series-book": 136,
@@ -953,6 +963,77 @@ def build_online_record(meta: EpubMetadata, best: RankedOnlineMatch) -> BookReco
     )
 
 
+def fetch_online_candidates(meta: EpubMetadata, providers: list[str], timeout: float) -> list[OnlineCandidate]:
+    all_candidates: list[OnlineCandidate] = []
+    provider_functions = {
+        "google": google_books_candidates,
+        "openlibrary": open_library_candidates,
+        "crossref": crossref_candidates,
+        "hathitrust": hathitrust_candidates,
+        "lubimyczytac": lubimyczytac_candidates,
+    }
+    with ONLINE_ENRICH_SEMAPHORE:
+        for provider in providers:
+            func = provider_functions.get(provider)
+            if func is None:
+                continue
+            try:
+                candidates = func(meta, timeout)
+            except Exception as exc:
+                meta.errors.append(f"{provider}: {exc}")
+                continue
+            all_candidates.extend(candidates)
+            if any(candidate.reason == "isbn-exact" and candidate.score >= 420 for candidate in candidates):
+                break
+    return all_candidates
+
+
+def verify_record_against_online(record: BookRecord, candidates: list[OnlineCandidate]) -> OnlineVerification:
+    if not candidates:
+        return OnlineVerification(False, False, False, False, False, [])
+
+    providers: list[str] = []
+    author_confirmed = False
+    title_confirmed = False
+    series_confirmed = record.series == "Standalone"
+    volume_confirmed = record.volume is None
+    record_author_keys = author_match_keys(split_authors(record.author))
+    record_title_key = normalize_match_text(record.title)
+    record_series_key = normalize_match_text(record.series)
+
+    for online_candidate in candidates:
+        if online_candidate.provider not in providers:
+            providers.append(online_candidate.provider)
+        if record_author_keys and record_author_keys.intersection(author_match_keys(online_candidate.authors)):
+            author_confirmed = True
+
+        candidate_title_key = normalize_match_text(online_candidate.title)
+        if record_title_key and (
+            candidate_title_key == record_title_key or similarity_score(record.title, online_candidate.title) >= 0.9
+        ):
+            title_confirmed = True
+
+        parsed_candidates: list[Candidate] = []
+        collect_title_candidates(online_candidate.title, parsed_candidates)
+        collect_core_candidates(online_candidate.title, parsed_candidates)
+        for parsed in parsed_candidates:
+            if not title_confirmed and parsed.title_override:
+                parsed_title_key = normalize_match_text(parsed.title_override)
+                if parsed_title_key == record_title_key or similarity_score(record.title, parsed.title_override) >= 0.9:
+                    title_confirmed = True
+            if not series_confirmed and record_series_key and normalize_match_text(parsed.series) == record_series_key:
+                series_confirmed = True
+            if not volume_confirmed and parsed.volume == record.volume:
+                volume_confirmed = True
+
+        if record.series != "Standalone" and not series_confirmed and candidate_title_key:
+            if record_series_key and record_series_key in candidate_title_key:
+                series_confirmed = True
+        if author_confirmed and title_confirmed and series_confirmed and volume_confirmed:
+            break
+
+    return OnlineVerification(True, author_confirmed, title_confirmed, series_confirmed, volume_confirmed, providers)
+
 
 def parse_existing_filename(stem: str) -> tuple[str, str, tuple[int, str] | None, str] | None:
     prefix, sep, title = stem.rpartition(" - ")
@@ -1602,28 +1683,7 @@ def lubimyczytac_candidates(meta: EpubMetadata, timeout: float) -> list[OnlineCa
 
 
 def enrich_from_online(meta: EpubMetadata, providers: list[str], timeout: float) -> BookRecord | None:
-    all_candidates: list[OnlineCandidate] = []
-    provider_functions = {
-        "google": google_books_candidates,
-        "openlibrary": open_library_candidates,
-        "crossref": crossref_candidates,
-        "hathitrust": hathitrust_candidates,
-        "lubimyczytac": lubimyczytac_candidates,
-    }
-    with ONLINE_ENRICH_SEMAPHORE:
-        for provider in providers:
-            func = provider_functions.get(provider)
-            if func is None:
-                continue
-            try:
-                candidates = func(meta, timeout)
-            except Exception as exc:
-                meta.errors.append(f"{provider}: {exc}")
-                continue
-            all_candidates.extend(candidates)
-            if any(candidate.reason == "isbn-exact" and candidate.score >= 420 for candidate in candidates):
-                break
-
+    all_candidates = fetch_online_candidates(meta, providers, timeout)
     best = pick_best_online_match(meta, all_candidates)
     if best is None:
         return None
@@ -1696,12 +1756,14 @@ def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], tim
         return finalize_record_quality(record, meta, 100, title_from_core=False)
 
     segment_author = ""
+    author_from_trailing_core = False
     if len(meta.segments) > 1:
         second = clean_author_segment(meta.segments[1])
         if looks_like_author_segment(second):
             segment_author = second
     if not segment_author and not meta.creators:
         segment_author = extract_trailing_author_from_core(meta.core)
+        author_from_trailing_core = bool(segment_author)
 
     author = extract_authors(meta.creators, segment_author)
     candidates: list[Candidate] = []
@@ -1761,13 +1823,16 @@ def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], tim
         decision_reasons=[f"inference:{source}"],
     )
 
+    online_candidates: list[OnlineCandidate] = []
     if use_online and (
         record.series == "Standalone"
         or record.volume is None
         or record.author == "Nieznany Autor"
         or source_needs_online_verification(record.source)
     ):
-        online = enrich_from_online(meta, providers, timeout)
+        online_candidates = fetch_online_candidates(meta, providers, timeout)
+        best_online = pick_best_online_match(meta, online_candidates)
+        online = build_online_record(meta, best_online) if best_online is not None else None
         if online:
             record.online_checked = True
             record.notes.append(f"online-checked:{online.source}")
@@ -1824,6 +1889,34 @@ def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], tim
                     record.notes.append(f"online-applied:{online.source}")
                     record.decision_reasons.extend(online.decision_reasons)
                     base_confidence = max(base_confidence, online.confidence)
+
+    if use_online:
+        verification = verify_record_against_online(record, online_candidates)
+        if verification.checked:
+            provider_text = ",".join(verification.providers)
+            record.notes.append(f"online-verify:{provider_text}")
+            record.decision_reasons.extend(
+                [
+                    f"online-verify-author:{'yes' if verification.author_confirmed else 'no'}",
+                    f"online-verify-series:{'yes' if verification.series_confirmed else 'no'}",
+                    f"online-verify-volume:{'yes' if verification.volume_confirmed else 'no'}",
+                    f"online-verify-title:{'yes' if verification.title_confirmed else 'no'}",
+                ]
+            )
+            if author_from_trailing_core and not verification.author_confirmed:
+                record.author = "Nieznany Autor"
+                record.review_reasons.append("online-brak-potwierdzenia-autora")
+                base_confidence = min(base_confidence, 52)
+            if source_needs_online_verification(record.source):
+                if record.series != "Standalone" and not verification.series_confirmed:
+                    record.review_reasons.append("online-brak-potwierdzenia-serii")
+                    base_confidence = min(base_confidence, 60)
+                if record.volume is not None and not verification.volume_confirmed:
+                    record.review_reasons.append("online-brak-potwierdzenia-tomu")
+                    base_confidence = min(base_confidence, 60)
+                if title_from_core and not verification.title_confirmed:
+                    record.review_reasons.append("online-brak-potwierdzenia-tytulu")
+                    base_confidence = min(base_confidence, 58)
 
     if not record.title:
         fallback_title = sanitize_title(meta.core, record.series, record.volume)

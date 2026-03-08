@@ -130,6 +130,24 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.volume, (1, "00"))
         self.assertEqual(record.title, "Assassin Summoner")
 
+    def test_unconfirmed_trailing_author_is_downgraded_when_online_enabled(self) -> None:
+        stem = "Spite the Dark 01_Assassin Summoner_ Aaron Renfroe -- Anna’s Archive"
+        meta = make_meta(stem)
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=[]):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["google"], timeout=1.0)
+        self.assertEqual(record.author, "Renfroe Aaron")
+
+    def test_unconfirmed_trailing_author_is_removed_when_online_conflicts(self) -> None:
+        stem = "Spite the Dark 01_Assassin Summoner_ Aaron Renfroe -- Anna’s Archive"
+        meta = make_meta(stem)
+        fake_candidates = [
+            kod_v3.OnlineCandidate("lubimyczytac", "lubimyczytac", "Some Other Book", ["Jane Smith"], [], 180, "approx")
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=fake_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["google"], timeout=1.0)
+        self.assertEqual(record.author, "Nieznany Autor")
+        self.assertIn("online-brak-potwierdzenia-autora", record.review_reasons)
+
     def test_father_of_constructs_source_prefers_series_over_publisher(self) -> None:
         stem = (
             "Father of Constructs 03 The Eldritch Artisan_ Father of Constructs_ Book 3 (LitRPG) -- "
