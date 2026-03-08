@@ -102,7 +102,8 @@ ONLINE_AMBIGUITY_MARGIN = 25
 ONLINE_HTTP_SLOTS = 4
 ONLINE_ENRICH_SEMAPHORE = threading.BoundedSemaphore(ONLINE_HTTP_SLOTS)
 APP_NAME = "ebookRen"
-APP_VERSION = "1.0"
+APP_VERSION = "15.0"
+GUI_FOOTER_TEXT = "v15. 2026. Piotr Grechuta"
 DEFAULT_SOURCE_FOLDER = str(Path.cwd())
 DEFAULT_PROVIDERS = "google,openlibrary,crossref,hathitrust,lubimyczytac"
 DEFAULT_HTTP_TIMEOUT = 8.0
@@ -2323,6 +2324,10 @@ def launch_gui(
 
     output = tk.Text(frame, wrap="word", height=20)
     output.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+
+    ttk.Label(frame, text=GUI_FOOTER_TEXT, font=("Segoe UI", 8)).grid(
+        row=10, column=0, columnspan=2, sticky="e", pady=(6, 0)
+    )
 
     frame.columnconfigure(0, weight=1)
     frame.rowconfigure(9, weight=1)
