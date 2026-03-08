@@ -864,9 +864,18 @@ def online_candidate_group_key(candidate: OnlineCandidate) -> tuple[str, tuple[s
     return title_key, author_keys, identifiers
 
 
+def is_online_candidate(candidate: object) -> bool:
+    return all(
+        hasattr(candidate, attribute)
+        for attribute in ("provider", "source", "title", "authors", "identifiers", "score", "reason")
+    )
+
+
 def aggregate_online_candidates(candidates: Iterable[OnlineCandidate]) -> list[RankedOnlineMatch]:
     grouped: dict[tuple[str, tuple[str, ...], tuple[str, ...]], list[OnlineCandidate]] = {}
     for candidate in candidates:
+        if not is_online_candidate(candidate):
+            continue
         key = online_candidate_group_key(candidate)
         grouped.setdefault(key, []).append(candidate)
 
@@ -1047,6 +1056,8 @@ def verify_record_against_online(record: BookRecord, candidates: list[OnlineCand
     record_series_key = normalize_match_text(record.series)
 
     for online_candidate in candidates:
+        if not is_online_candidate(online_candidate):
+            continue
         if online_candidate.provider not in providers:
             providers.append(online_candidate.provider)
         if record_author_keys and record_author_keys.intersection(author_match_keys(online_candidate.authors)):

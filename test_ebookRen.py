@@ -234,6 +234,17 @@ class KodV3Tests(unittest.TestCase):
         assert best is not None
         self.assertIn("ambiguous", best.reason)
 
+    def test_pick_best_online_match_ignores_local_candidate_objects(self) -> None:
+        meta = make_meta("Right Book", title="Right Book", creators=["Test Author"])
+        candidates = [
+            kod_v3.Candidate(90, "Series", (1, "00"), "Right Book", "core:joined"),
+            kod_v3.OnlineCandidate("google-books", "google-books", "Right Book", ["Test Author"], [], 300, "title-author-exact"),
+        ]
+        best = kod_v3.pick_best_online_match(meta, candidates)
+        self.assertIsNotNone(best)
+        assert best is not None
+        self.assertEqual(best.providers, ["google-books"])
+
     def test_ambiguous_online_is_checked_but_not_applied(self) -> None:
         meta = make_meta("Mystery Book")
         offline = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
