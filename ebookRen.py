@@ -621,6 +621,18 @@ def split_authors(text: str) -> list[str]:
     return [clean(part) for part in re.split(r"\s*&\s*", text) if clean(part)]
 
 
+def canonicalize_authors(authors: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for author in authors:
+        normalized = to_last_first(author)
+        key = author_key(normalized)
+        if normalized and key and key not in seen:
+            seen.add(key)
+            result.append(normalized)
+    result.sort(key=lambda item: author_key(item))
+    return result
+
 
 def to_last_first(name: str) -> str:
     name = clean(re.sub(r"\[.*?\]", "", name))
@@ -1194,15 +1206,7 @@ def extract_authors(creators: list[str], segment_author: str) -> str:
         raw.extend(split_authors(creator))
     if segment_author and re.search(r"[A-Za-z]", segment_author) and len(creators) <= 1:
         raw.extend(split_authors(segment_author))
-
-    result: list[str] = []
-    seen: set[str] = set()
-    for author in raw:
-        normalized = to_last_first(author)
-        key = author_key(normalized)
-        if normalized and key and key not in seen:
-            seen.add(key)
-            result.append(normalized)
+    result = canonicalize_authors(raw)
     return " & ".join(result) if result else "Nieznany Autor"
 
 

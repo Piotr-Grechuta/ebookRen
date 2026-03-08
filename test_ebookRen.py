@@ -329,6 +329,12 @@ class KodV3Tests(unittest.TestCase):
     def test_to_last_first_keeps_multiword_surname_particles(self) -> None:
         self.assertEqual(kod_v3.to_last_first("Ludwig van Beethoven"), "van Beethoven Ludwig")
 
+    def test_extract_authors_sorts_coauthors_deterministically(self) -> None:
+        left = kod_v3.extract_authors([], "Alex Beaumont & Cale Plamann")
+        right = kod_v3.extract_authors([], "Cale Plamann & Alex Beaumont")
+        self.assertEqual(left, "Beaumont Alex & Plamann Cale")
+        self.assertEqual(right, left)
+
     def test_build_undo_plan_uses_raw_csv_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
