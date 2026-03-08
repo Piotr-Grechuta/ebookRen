@@ -2338,6 +2338,98 @@ def run_job(
     if not files:
         return 0, ["Brak obslugiwanych plikow ebook."]
 
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dry_run = not apply_changes
+    report_name = "rename_books_preview" if dry_run else "rename_books_log"
+    report_path = folder / f"{report_name}_{stamp}.csv"
+    lines: list[str] = []
+
+    if apply_changes:
+        infer_workers = 1
+        read_ms = 0
+        infer_ms = 0
+        execute_ms = 0
+        records: list[BookRecord] = []
+        execution_status: dict[Path, str] = {}
+        errors: list[str] = []
+        to_write = 0
+        written_total = 0
+
+        for path in files:
+            read_started_at = time.perf_counter()
+            meta = read_book_metadata(path)
+            read_ms += int((time.perf_counter() - read_started_at) * 1000)
+
+            infer_started_at = time.perf_counter()
+            record = infer_record(meta, use_online=use_online, providers=providers, timeout=timeout)
+            infer_ms += int((time.perf_counter() - infer_started_at) * 1000)
+
+            record.output_folder = target_folder
+            record = dedupe_destinations([record], target_folder)[0]
+            records.append(record)
+
+            if operation == "rename" and record.path.name == record.filename:
+                execution_status[record.path.resolve()] = "unchanged"
+                continue
+
+            moves = build_moves([record], folder, target_folder, stamp)
+            if not moves:
+                execution_status[record.path.resolve()] = "unchanged"
+                continue
+
+            to_write += len(moves)
+            execute_started_at = time.perf_counter()
+            move_errors = execute_moves(moves)
+            execute_ms += int((time.perf_counter() - execute_started_at) * 1000)
+            if move_errors:
+                execution_status[record.path.resolve()] = "failed"
+                errors.extend(move_errors)
+            else:
+                execution_status[record.path.resolve()] = "renamed" if operation == "rename" else "copied"
+                written_total += len(moves)
+
+        write_report(
+            report_path,
+            records,
+            dry_run=False,
+            source_folder=folder,
+            target_folder=target_folder,
+            operation=operation,
+            execution_status=execution_status,
+        )
+        review_total = sum(1 for record in records if record.needs_review)
+        lines.append(
+            f"TOTAL={len(records)} | TO_WRITE={to_write} | WRITTEN={written_total} | REVIEW={review_total} | ERRORS={len(errors)}"
+        )
+        lines.extend(
+            [
+                f"OPERATION={operation.upper()}",
+                f"SOURCE={folder}",
+                f"DESTINATION={target_folder}",
+                f"INFER_WORKERS={infer_workers}",
+                f"ONLINE_HTTP_SLOTS={ONLINE_HTTP_SLOTS}",
+                f"TO_WRITE={to_write}",
+                f"WRITTEN={written_total}",
+                f"REVIEW={review_total}",
+                f"ERRORS={len(errors)}",
+                f"REPORT={report_path}",
+            ]
+        )
+        lines.extend(
+            [
+                f"PROFILE_READ_MS={read_ms}",
+                f"PROFILE_INFER_MS={infer_ms}",
+                f"PROFILE_EXECUTE_MS={execute_ms}",
+                f"PROFILE_TOTAL_MS={int((time.perf_counter() - started_at) * 1000)}",
+            ]
+        )
+        flush_online_cache_if_needed(force=True)
+        if errors:
+            lines.append("---ERRORS---")
+            lines.extend(errors[:20])
+            return 1, lines
+        return 0, lines
+
     read_started_at = time.perf_counter()
     with ThreadPoolExecutor(max_workers=max(1, min(8, len(files)))) as executor:
         metas = list(executor.map(read_book_metadata, files))
@@ -2356,10 +2448,6 @@ def run_job(
 
     records = set_output_folder(records, target_folder)
     records = dedupe_destinations(records, target_folder)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dry_run = not apply_changes
-    report_name = "rename_books_preview" if dry_run else "rename_books_log"
-    report_path = folder / f"{report_name}_{stamp}.csv"
     execution_status: dict[Path, str] = {}
     if dry_run:
         for record in records:
@@ -2374,7 +2462,6 @@ def run_job(
             else:
                 execution_status[record.path.resolve()] = "pending"
 
-    lines: list[str] = []
     if dry_run:
         write_report(
             report_path,

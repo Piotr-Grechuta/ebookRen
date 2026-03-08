@@ -520,6 +520,57 @@ class KodV3Tests(unittest.TestCase):
             self.assertIn("INFER_WORKERS=1", lines)
             self.assertIn("ONLINE_HTTP_SLOTS=4", lines)
 
+    def test_apply_copy_streams_first_file_before_batch_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as src_tmp, tempfile.TemporaryDirectory() as dst_tmp:
+            source_folder = Path(src_tmp)
+            destination_folder = Path(dst_tmp)
+            (source_folder / "Alpha.epub").touch()
+            (source_folder / "Beta.epub").touch()
+
+            def fake_infer(meta, use_online, providers, timeout):
+                if meta.path.name == "Beta.epub":
+                    time.sleep(0.6)
+                return kod_v3.BookRecord(
+                    path=meta.path,
+                    author="Author",
+                    series="Series",
+                    volume=(1, "00"),
+                    title=meta.path.stem,
+                    source="test",
+                    identifiers=[],
+                    notes=[],
+                    confidence=90,
+                    review_reasons=[],
+                    decision_reasons=[],
+                )
+
+            result: list[tuple[int, list[str]]] = []
+
+            def worker() -> None:
+                result.append(
+                    kod_v3.run_job(
+                        source_folder,
+                        destination_folder=destination_folder,
+                        apply_changes=True,
+                        use_online=False,
+                        providers=[],
+                        timeout=1.0,
+                        limit=0,
+                    )
+                )
+
+            with mock.patch.object(kod_v3, "infer_record", side_effect=fake_infer):
+                thread = threading.Thread(target=worker)
+                thread.start()
+                alpha_target = destination_folder / "Author - Series - Tom 01.00 - Alpha.epub"
+                deadline = time.time() + 0.4
+                while time.time() < deadline and not alpha_target.exists():
+                    time.sleep(0.02)
+                self.assertTrue(alpha_target.exists())
+                thread.join()
+
+            self.assertEqual(result[0][0], 0)
+
     def test_copy_report_contains_copy_operation(self) -> None:
         with tempfile.TemporaryDirectory() as src_tmp, tempfile.TemporaryDirectory() as dst_tmp:
             source_folder = Path(src_tmp)
