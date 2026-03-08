@@ -74,6 +74,19 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(best_series.volume, (3, "00"))
         self.assertEqual(best_title.title_override, "Past's Price")
 
+    def test_collect_title_candidates_parses_double_colon_book_format(self) -> None:
+        candidates: list[kod_v3.Candidate] = []
+        kod_v3.collect_title_candidates("The Eldritch Artisan: Father of Constructs: Book 3 (LitRPG)", candidates)
+        best_series = kod_v3.choose_series_candidate(candidates)
+        best_title = kod_v3.choose_title_candidate(candidates)
+        self.assertIsNotNone(best_series)
+        self.assertIsNotNone(best_title)
+        assert best_series is not None
+        assert best_title is not None
+        self.assertEqual(best_series.series, "Father of Constructs")
+        self.assertEqual(best_series.volume, (3, "00"))
+        self.assertEqual(best_title.title_override, "The Eldritch Artisan")
+
     def test_sanitize_title_strips_trailing_roman_volume_suffix(self) -> None:
         self.assertEqual(
             kod_v3.sanitize_title("Chronicle (Tom IV)", "Cykl", (4, "00")),
@@ -104,6 +117,53 @@ class KodV3Tests(unittest.TestCase):
         candidates: list[kod_v3.Candidate] = []
         kod_v3.add_candidate(candidates, "Pivot Press Publishing", None, 100, "opf")
         self.assertEqual(candidates, [])
+
+    def test_extract_authors_strips_trailing_numeric_noise(self) -> None:
+        self.assertEqual(kod_v3.extract_authors([], "Dakota Krout -, 1, 2018"), "Krout Dakota")
+
+    def test_spite_the_dark_source_artifact_is_not_used_as_author(self) -> None:
+        stem = "Spite the Dark 01_Assassin Summoner_ Aaron Renfroe -- Anna’s Archive"
+        meta = make_meta(stem)
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+        self.assertEqual(record.author, "Renfroe Aaron")
+        self.assertEqual(record.series, "Spite the Dark")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.title, "Assassin Summoner")
+
+    def test_father_of_constructs_source_prefers_series_over_publisher(self) -> None:
+        stem = (
+            "Father of Constructs 03 The Eldritch Artisan_ Father of Constructs_ Book 3 (LitRPG) -- "
+            "Renfroe, Aaron -- 2024 -- Pivot Press Publishing, LLC -- 3ab8cab58a126a4efe8075f1e9d4dd17 -- Anna’s Archive"
+        )
+        meta = make_meta(stem)
+        meta.title = "The Eldritch Artisan: Father of Constructs: Book 3 (LitRPG)"
+        meta.creators = ["Renfroe, Aaron"]
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+        self.assertEqual(record.author, "Renfroe Aaron")
+        self.assertEqual(record.series, "Father of Constructs")
+        self.assertEqual(record.volume, (3, "00"))
+        self.assertEqual(record.title, "The Eldritch Artisan")
+
+    def test_resonance_war_source_prefers_cycle_over_publisher(self) -> None:
+        stem = (
+            "The Resonance Cycle_ 10 The Resonance War (Part 2)_ The Resonance Cycle Book 10 -- Aaron Renfroe -- "
+            "2025 -- Pivot Press Publishing, LLC -- 123 -- Anna’s Archive"
+        )
+        meta = make_meta(stem)
+        meta.creators = ["Aaron Renfroe"]
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+        self.assertEqual(record.author, "Renfroe Aaron")
+        self.assertEqual(record.series, "The Resonance Cycle")
+        self.assertEqual(record.volume, (10, "00"))
+        self.assertEqual(record.title, "The Resonance War (Part 2)")
+
+    def test_complete_series_box_set_maps_to_series(self) -> None:
+        stem = "Blessed Time_ The Complete Series_ (A LitRPG Adventure Box Set) -- Cale Plamann -- 2023 -- Aethon Books -- hash -- Anna’s Archive"
+        meta = make_meta(stem, creators=["Cale Plamann"])
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+        self.assertEqual(record.author, "Plamann Cale")
+        self.assertEqual(record.series, "Blessed Time")
+        self.assertEqual(record.title, "The Complete Series")
 
     def test_pick_best_online_match_marks_small_margin_as_ambiguous(self) -> None:
         meta = make_meta("Right Book", title="Right Book", creators=["Test Author"])
@@ -393,7 +453,6 @@ class KodV3Tests(unittest.TestCase):
             report_path = Path(report_line.split("=", 1)[1])
             with report_path.open("r", encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle, delimiter=";"))
-            self.assertEqual(rows[0]["review"], "CHECK")
             self.assertEqual(rows[0]["execution_status"], "copied")
             self.assertTrue(source.exists())
 

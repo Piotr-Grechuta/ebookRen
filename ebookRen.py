@@ -78,8 +78,16 @@ TITLE_COLON_SERIES_INDEX_RE = re.compile(
     rf"^(.*?)\s*:\s*(.+?)\s*,\s*{SERIES_WORDS}\s*({VOLUME_INDEX_PATTERN})\s*$",
     re.IGNORECASE,
 )
+TITLE_DOUBLE_COLON_BOOK_RE = re.compile(
+    rf"^(.*?)\s*:\s*(.+?)\s*:\s*(?:Book|Tom|Volume|Vol\.?)\s*({VOLUME_INDEX_PATTERN})(?:\s*\([^)]*\))?$",
+    re.IGNORECASE,
+)
 TRAILING_BOOK_INDEX_RE = re.compile(
     rf"^(.*?)\s*,?\s*(?:Book|Tom|Volume|Vol\.?)\s*({VOLUME_INDEX_PATTERN})(?:\s*\[[^\]]+\])?$",
+    re.IGNORECASE,
+)
+BOX_SET_RE = re.compile(
+    r"^(.*?)\s+(The Complete Series|Complete Series|Omnibus|Box Set)(?:\s*[-:]\s*(.*?))?(?:\s*\([^)]*\))?$",
     re.IGNORECASE,
 )
 INDEXED_TITLE_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})\s*[:\-]\s*(.+)$", re.IGNORECASE)
@@ -100,6 +108,8 @@ HEX_NOISE_RE = re.compile(r"\b[0-9a-f]{12,}\b", re.IGNORECASE)
 ISBN_RE = re.compile(r"(97[89][0-9]{10}|[0-9]{9}[0-9Xx])")
 GENRE_TAIL_RE = re.compile(r"\s*(?:\[[^\]]+\]|\((?:isekai|litrpg|progression fantasy|cultivation|fantasy|sci-fi|scifi)[^)]*\))\s*$", re.IGNORECASE)
 PUBLISHER_LIKE_RE = re.compile(r"\b(?:press|publishing|books|book group|media|house|studio|audio|audiobooks|editions)\b", re.IGNORECASE)
+SOURCE_ARTIFACT_RE = re.compile(r"\b(?:Anna.?s Archive|libgen(?:\.li)?|z-?library|zlib)\b", re.IGNORECASE)
+NULLISH_RE = re.compile(r"^(?:null|none|n/?a)(?:\s*,\s*(?:null|none|n/?a|\d{4}))*$", re.IGNORECASE)
 ONLINE_CACHE: dict[str, object | None] = {}
 ONLINE_CACHE_LOCK = threading.Lock()
 ONLINE_CACHE_INFLIGHT: dict[str, threading.Event] = {}
@@ -284,6 +294,40 @@ def clean_series(text: str | None) -> str:
 def is_publisher_like(text: str | None) -> bool:
     value = clean(text)
     return bool(value and PUBLISHER_LIKE_RE.search(value))
+
+
+def strip_source_artifacts(text: str | None) -> str:
+    value = clean(text)
+    if not value:
+        return ""
+    value = SOURCE_ARTIFACT_RE.sub("", value)
+    value = HEX_NOISE_RE.sub("", value)
+    return clean(value)
+
+
+def is_source_artifact(text: str | None) -> bool:
+    value = clean(text)
+    return bool(value and (SOURCE_ARTIFACT_RE.search(value) or NULLISH_RE.match(value)))
+
+
+def looks_like_author_segment(text: str | None) -> bool:
+    value = strip_source_artifacts(text)
+    if not value or is_publisher_like(value) or is_source_artifact(value):
+        return False
+    if not re.search(r"[A-Za-z]", value):
+        return False
+    if re.fullmatch(r"\d{4}", value):
+        return False
+    return True
+
+
+def clean_author_segment(text: str | None) -> str:
+    value = strip_source_artifacts(text)
+    if not value:
+        return ""
+    value = re.sub(r"\s*[-,;]\s*\d+(?:\s*,\s*\d{4})?\s*$", "", value)
+    value = re.sub(r"\s*,\s*\d{4}\s*$", "", value)
+    return clean(value)
 
 
 class MaxLevelFilter(logging.Filter):
@@ -623,12 +667,16 @@ def trim_title_for_path(folder: Path, author: str, series: str, volume: str, tit
 
 
 def split_authors(text: str) -> list[str]:
-    text = clean(text)
+    text = clean_author_segment(text)
     if not text:
         return []
     text = re.sub(r"\[.*?\]", "", text)
     text = text.replace(";", " & ")
     text = re.sub(r"\s+(?:and|i)\s+", " & ", text, flags=re.IGNORECASE)
+    if "&" not in text:
+        comma_parts = [clean(part) for part in re.split(r"\s*,\s*", text) if clean(part)]
+        if len(comma_parts) >= 2 and all(len(part.split()) >= 2 for part in comma_parts):
+            return comma_parts
     return [clean(part) for part in re.split(r"\s*&\s*", text) if clean(part)]
 
 
@@ -968,6 +1016,46 @@ def source_needs_online_verification(source: str) -> bool:
     return source.startswith("core:") or source.startswith("segment:")
 
 
+def extract_trailing_author_from_core(text: str) -> str:
+    value = strip_source_artifacts(text)
+    parts = value.split()
+    if len(parts) < 2:
+        return ""
+    surname_particles = {
+        "al",
+        "bin",
+        "da",
+        "de",
+        "del",
+        "della",
+        "der",
+        "di",
+        "du",
+        "ibn",
+        "la",
+        "le",
+        "san",
+        "st",
+        "st.",
+        "van",
+        "von",
+    }
+    blocked_tokens = {"book", "part", "series", "tom", "volume"}
+    for size in (2, 3):
+        if len(parts) < size:
+            continue
+        candidate = clean_author_segment(" ".join(parts[-size:]))
+        if not looks_like_author_segment(candidate):
+            continue
+        name_parts = candidate.split()
+        if size == 3 and name_parts[1].lower() not in surname_particles:
+            continue
+        if any(token.lower() in blocked_tokens for token in name_parts):
+            continue
+        return candidate
+    return ""
+
+
 def split_trailing_series_book(title: str) -> tuple[str, str, tuple[int, str] | None] | None:
     match = TRAILING_BOOK_INDEX_RE.match(title)
     if not match:
@@ -1015,6 +1103,17 @@ def collect_title_candidates(title: str, candidates: list[Candidate]) -> None:
     title = clean(title)
     if not title:
         return
+
+    match = TITLE_DOUBLE_COLON_BOOK_RE.match(title)
+    if match:
+        add_candidate(
+            candidates,
+            match.group(2),
+            parse_volume_parts(match.group(3)),
+            98,
+            "title:double-colon-book",
+            match.group(1),
+        )
 
     trailing_series_book = split_trailing_series_book(title)
     if trailing_series_book is not None:
@@ -1082,12 +1181,34 @@ def collect_title_candidates(title: str, candidates: list[Candidate]) -> None:
             "title:index-only",
         )
 
+    match = BOX_SET_RE.match(title)
+    if match:
+        add_candidate(
+            candidates,
+            match.group(1),
+            None,
+            82,
+            "title:box-set",
+            match.group(2),
+        )
+
 
 
 def collect_core_candidates(core: str, candidates: list[Candidate]) -> None:
     core = clean(core)
     if not core:
         return
+
+    match = BOX_SET_RE.match(core)
+    if match:
+        add_candidate(
+            candidates,
+            match.group(1),
+            None,
+            81,
+            "core:box-set",
+            match.group(2),
+        )
 
     match = PAREN_SERIES_RE.match(core)
     if match:
@@ -1147,8 +1268,8 @@ def collect_core_candidates(core: str, candidates: list[Candidate]) -> None:
 
 def collect_segment_candidates(segments: list[str], candidates: list[Candidate]) -> None:
     for segment in segments[2:6]:
-        segment = clean(segment)
-        if not segment:
+        segment = strip_source_artifacts(segment)
+        if not segment or is_source_artifact(segment) or is_publisher_like(segment):
             continue
 
         match = SEGMENT_HASH_RE.search(segment)
@@ -1184,7 +1305,7 @@ def collect_segment_candidates(segments: list[str], candidates: list[Candidate])
 
 
 def sanitize_title(title: str, series: str, volume: tuple[int, str] | None) -> str:
-    title = clean(title)
+    title = strip_source_artifacts(title)
     if not title:
         return ""
     title = GENRE_TAIL_RE.sub("", title)
@@ -1234,7 +1355,7 @@ def strip_author_from_title(title: str, author: str) -> str:
 
 def read_book_metadata(path: Path) -> EpubMetadata:
     stem = path.stem
-    segments = [clean(part) for part in re.split(r"\s*--\s*", stem) if clean(part)]
+    segments = [strip_source_artifacts(part) for part in re.split(r"\s*--\s*", stem) if strip_source_artifacts(part)]
     core = segments[0] if segments else stem
     meta = EpubMetadata(path=path, stem=stem, segments=segments, core=core)
 
@@ -1576,9 +1697,11 @@ def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], tim
 
     segment_author = ""
     if len(meta.segments) > 1:
-        second = meta.segments[1]
-        if re.search(r"[A-Za-z]", second) and not re.match(r"^\d{4}$", second):
+        second = clean_author_segment(meta.segments[1])
+        if looks_like_author_segment(second):
             segment_author = second
+    if not segment_author and not meta.creators:
+        segment_author = extract_trailing_author_from_core(meta.core)
 
     author = extract_authors(meta.creators, segment_author)
     candidates: list[Candidate] = []
