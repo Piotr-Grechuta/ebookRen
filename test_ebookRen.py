@@ -148,6 +148,34 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.author, "Nieznany Autor")
         self.assertIn("online-brak-potwierdzenia-autora", record.review_reasons)
 
+    def test_sanitize_title_for_online_query_strips_author_prefix_and_noise(self) -> None:
+        value = kod_v3.sanitize_title_for_online_query(
+            "Cale Plamann - A Dream of Wings & Flame A LitRPG Adventure (2024, Aethon Books)",
+            "Nieznany Autor",
+            "A Dream of Wings & Flame",
+            (1, "00"),
+        )
+        self.assertEqual(value, "A Dream of Wings & Flame A LitRPG Adventure")
+
+    def test_build_online_query_variants_uses_author_embedded_in_title(self) -> None:
+        meta = make_meta("x")
+        record = kod_v3.BookRecord(
+            path=Path("x.mobi"),
+            author="Nieznany Autor",
+            series="A Dream of Wings & Flame",
+            volume=(1, "00"),
+            title="Cale Plamann - A Dream of Wings & Flame A LitRPG Adventure (2024, Aethon Books)",
+            source="core:joined",
+            identifiers=[],
+            notes=[],
+            confidence=50,
+            review_reasons=[],
+            decision_reasons=[],
+        )
+        variants = kod_v3.build_online_query_variants(meta, record)
+        self.assertTrue(any("Plamann Cale" in " | ".join(variant.creators) or "Cale Plamann" in " | ".join(variant.creators) for variant in variants))
+        self.assertTrue(any(variant.title == "A Dream of Wings & Flame A LitRPG Adventure" for variant in variants))
+
     def test_father_of_constructs_source_prefers_series_over_publisher(self) -> None:
         stem = (
             "Father of Constructs 03 The Eldritch Artisan_ Father of Constructs_ Book 3 (LitRPG) -- "

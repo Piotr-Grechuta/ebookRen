@@ -110,6 +110,7 @@ GENRE_TAIL_RE = re.compile(r"\s*(?:\[[^\]]+\]|\((?:isekai|litrpg|progression fan
 PUBLISHER_LIKE_RE = re.compile(r"\b(?:press|publishing|books|book group|media|house|studio|audio|audiobooks|editions)\b", re.IGNORECASE)
 SOURCE_ARTIFACT_RE = re.compile(r"\b(?:Anna.?s Archive|libgen(?:\.li)?|z-?library|zlib)\b", re.IGNORECASE)
 NULLISH_RE = re.compile(r"^(?:null|none|n/?a)(?:\s*,\s*(?:null|none|n/?a|\d{4}))*$", re.IGNORECASE)
+QUERY_NOISE_PAREN_RE = re.compile(r"\((?:[^)]*\d{4}[^)]*|[^)]*(?:press|publishing|books)\b[^)]*)\)", re.IGNORECASE)
 ONLINE_CACHE: dict[str, object | None] = {}
 ONLINE_CACHE_LOCK = threading.Lock()
 ONLINE_CACHE_INFLIGHT: dict[str, threading.Event] = {}
@@ -988,6 +989,49 @@ def fetch_online_candidates(meta: EpubMetadata, providers: list[str], timeout: f
     return all_candidates
 
 
+def build_online_query_variants(meta: EpubMetadata, record: BookRecord) -> list[EpubMetadata]:
+    variants: list[EpubMetadata] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+
+    def add_variant(title: str, creators: list[str]) -> None:
+        normalized_title = clean(title)
+        normalized_creators = [clean_author_segment(item) for item in creators if clean_author_segment(item)]
+        key = (normalize_match_text(normalized_title), tuple(sorted(author_match_keys(normalized_creators))))
+        if not normalized_title or key in seen:
+            return
+        seen.add(key)
+        variants.append(
+            EpubMetadata(
+                path=meta.path,
+                stem=meta.stem,
+                segments=list(meta.segments),
+                core=normalized_title,
+                title=normalized_title,
+                creators=list(normalized_creators),
+                identifiers=list(meta.identifiers),
+                meta_series=meta.meta_series,
+                meta_volume=meta.meta_volume,
+                errors=[],
+            )
+        )
+
+    record_authors = split_authors(record.author) if record.author != "Nieznany Autor" else []
+    if not record_authors and " - " in record.title:
+        left, _, _ = record.title.partition(" - ")
+        if looks_like_author_segment(left):
+            record_authors = split_authors(left)
+    cleaned_title = sanitize_title_for_online_query(record.title, record.author, record.series, record.volume)
+    if cleaned_title:
+        add_variant(cleaned_title, record_authors)
+    if record.series and record.series != "Standalone":
+        if record.volume is not None:
+            add_variant(f"{record.series} Book {record.volume[0]}", record_authors)
+            if cleaned_title:
+                add_variant(f"{cleaned_title}: {record.series}: Book {record.volume[0]}", record_authors)
+        add_variant(record.series, record_authors)
+    return variants
+
+
 def verify_record_against_online(record: BookRecord, candidates: list[OnlineCandidate]) -> OnlineVerification:
     if not candidates:
         return OnlineVerification(False, False, False, False, False, [])
@@ -1135,6 +1179,24 @@ def extract_trailing_author_from_core(text: str) -> str:
             continue
         return candidate
     return ""
+
+
+def sanitize_title_for_online_query(title: str, author: str, series: str, volume: tuple[int, str] | None) -> str:
+    value = strip_source_artifacts(title)
+    if not value:
+        return ""
+    value = QUERY_NOISE_PAREN_RE.sub("", value)
+    if " - " in value:
+        left, _, right = value.partition(" - ")
+        if looks_like_author_segment(left):
+            value = right
+    value = sanitize_title(value, series, volume) or value
+    if series and normalize_match_text(series) in normalize_match_text(value):
+        if volume is not None:
+            value = sanitize_title(value, series, volume) or value
+    value = strip_author_from_title(value, author)
+    value = clean(value)
+    return value
 
 
 def split_trailing_series_book(title: str) -> tuple[str, str, tuple[int, str] | None] | None:
@@ -1831,6 +1893,8 @@ def infer_record(meta: EpubMetadata, use_online: bool, providers: list[str], tim
         or source_needs_online_verification(record.source)
     ):
         online_candidates = fetch_online_candidates(meta, providers, timeout)
+        for variant in build_online_query_variants(meta, record):
+            online_candidates.extend(fetch_online_candidates(variant, providers, timeout))
         best_online = pick_best_online_match(meta, online_candidates)
         online = build_online_record(meta, best_online) if best_online is not None else None
         if online:
