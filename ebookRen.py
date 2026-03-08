@@ -78,6 +78,10 @@ TITLE_COLON_SERIES_INDEX_RE = re.compile(
     rf"^(.*?)\s*:\s*(.+?)\s*,\s*{SERIES_WORDS}\s*({VOLUME_INDEX_PATTERN})\s*$",
     re.IGNORECASE,
 )
+TRAILING_BOOK_INDEX_RE = re.compile(
+    rf"^(.*?)\s*,?\s*(?:Book|Tom|Volume|Vol\.?)\s*({VOLUME_INDEX_PATTERN})(?:\s*\[[^\]]+\])?$",
+    re.IGNORECASE,
+)
 INDEXED_TITLE_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})\s*[:\-]\s*(.+)$", re.IGNORECASE)
 INDEX_ONLY_RE = re.compile(rf"^(.+?)\s*[-:]\s*({VOLUME_INDEX_PATTERN})$", re.IGNORECASE)
 CORE_COMMA_RE = re.compile(rf"^(.+?)\s+({VOLUME_INDEX_PATTERN})\s*,\s*(.+)$", re.IGNORECASE)
@@ -94,6 +98,8 @@ TRAILING_SERIES_SUFFIX_RE = re.compile(
 ANNA_ARCHIVE_RE = re.compile(r"\bAnna.?s Archive\b", re.IGNORECASE)
 HEX_NOISE_RE = re.compile(r"\b[0-9a-f]{12,}\b", re.IGNORECASE)
 ISBN_RE = re.compile(r"(97[89][0-9]{10}|[0-9]{9}[0-9Xx])")
+GENRE_TAIL_RE = re.compile(r"\s*(?:\[[^\]]+\]|\((?:isekai|litrpg|progression fantasy|cultivation|fantasy|sci-fi|scifi)[^)]*\))\s*$", re.IGNORECASE)
+PUBLISHER_LIKE_RE = re.compile(r"\b(?:press|publishing|books|book group|media|house|studio|audio|audiobooks|editions)\b", re.IGNORECASE)
 ONLINE_CACHE: dict[str, object | None] = {}
 ONLINE_CACHE_LOCK = threading.Lock()
 ONLINE_CACHE_INFLIGHT: dict[str, threading.Event] = {}
@@ -273,6 +279,11 @@ def clean(text: str | None) -> str:
 
 def clean_series(text: str | None) -> str:
     return clean(text).strip(" ,")
+
+
+def is_publisher_like(text: str | None) -> bool:
+    value = clean(text)
+    return bool(value and PUBLISHER_LIKE_RE.search(value))
 
 
 class MaxLevelFilter(logging.Filter):
@@ -927,6 +938,8 @@ def add_candidate(
     cleaned = clean_series(series)
     if not cleaned:
         return
+    if source == "opf" and is_publisher_like(cleaned):
+        return
     candidates.append(Candidate(score, cleaned, volume, clean(title_override), source))
 
 
@@ -955,10 +968,65 @@ def source_needs_online_verification(source: str) -> bool:
     return source.startswith("core:") or source.startswith("segment:")
 
 
+def split_trailing_series_book(title: str) -> tuple[str, str, tuple[int, str] | None] | None:
+    match = TRAILING_BOOK_INDEX_RE.match(title)
+    if not match:
+        return None
+    body = clean(match.group(1))
+    volume = parse_volume_parts(match.group(2))
+    if not body or volume is None:
+        return None
+
+    parts = body.split()
+    if len(parts) < 3:
+        return None
+
+    joiners = {"of", "the", "and", "a", "an", "&"}
+    best: tuple[int, str, str] | None = None
+    for cut in range(1, len(parts) - 1):
+        title_part = clean(" ".join(parts[:cut]))
+        series_part = clean_series(" ".join(parts[cut:]))
+        if not title_part or not series_part or is_publisher_like(series_part):
+            continue
+        series_words = series_part.split()
+        if len(series_words) < 2:
+            continue
+
+        score = 0
+        if re.match(r"^(?:The|A|An)\b", series_part, flags=re.IGNORECASE):
+            score += 30
+        if 2 <= len(series_words) <= 5:
+            score += 20
+        score += sum(
+            1
+            for word in series_words
+            if word[:1].isupper() or word.lower() in joiners or word.startswith(("(", "["))
+        )
+        candidate = (score, title_part, series_part)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+
+    if best is None:
+        return None
+    return best[1], best[2], volume
+
+
 def collect_title_candidates(title: str, candidates: list[Candidate]) -> None:
     title = clean(title)
     if not title:
         return
+
+    trailing_series_book = split_trailing_series_book(title)
+    if trailing_series_book is not None:
+        title_part, series_part, volume = trailing_series_book
+        add_candidate(
+            candidates,
+            series_part,
+            volume,
+            95,
+            "title:trailing-series-book",
+            title_part,
+        )
 
     match = TITLE_WITH_SERIES_RE.match(title)
     if match:
@@ -1119,10 +1187,13 @@ def sanitize_title(title: str, series: str, volume: tuple[int, str] | None) -> s
     title = clean(title)
     if not title:
         return ""
+    title = GENRE_TAIL_RE.sub("", title)
     title = TRAILING_SERIES_SUFFIX_RE.sub("", title)
     if series and volume is not None:
         prefix = rf"^{re.escape(series)}\s+{volume_match_pattern(volume)}\s*[:\-]\s*"
         title = re.sub(prefix, "", title, flags=re.IGNORECASE)
+        suffix = rf"\s+{re.escape(series)}\s*,?\s*(?:Book|Tom|Volume|Vol\.?)\s*{volume_match_pattern(volume)}$"
+        title = re.sub(suffix, "", title, flags=re.IGNORECASE)
     if is_series_volume_only_title(title, series, volume):
         return ""
     return clean(title)

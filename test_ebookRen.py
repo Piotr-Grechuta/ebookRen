@@ -61,6 +61,19 @@ class KodV3Tests(unittest.TestCase):
         assert best is not None
         self.assertEqual(best.volume, (4, "00"))
 
+    def test_collect_title_candidates_parses_trailing_series_book_format(self) -> None:
+        candidates: list[kod_v3.Candidate] = []
+        kod_v3.collect_title_candidates("Past's Price The Resonance Cycle, Book 3 [Isekai, LitRPG]", candidates)
+        best_series = kod_v3.choose_series_candidate(candidates)
+        best_title = kod_v3.choose_title_candidate(candidates)
+        self.assertIsNotNone(best_series)
+        self.assertIsNotNone(best_title)
+        assert best_series is not None
+        assert best_title is not None
+        self.assertEqual(best_series.series, "The Resonance Cycle")
+        self.assertEqual(best_series.volume, (3, "00"))
+        self.assertEqual(best_title.title_override, "Past's Price")
+
     def test_sanitize_title_strips_trailing_roman_volume_suffix(self) -> None:
         self.assertEqual(
             kod_v3.sanitize_title("Chronicle (Tom IV)", "Cykl", (4, "00")),
@@ -73,6 +86,12 @@ class KodV3Tests(unittest.TestCase):
             "Chronicle",
         )
 
+    def test_sanitize_title_strips_genre_tail_and_series_book_suffix(self) -> None:
+        self.assertEqual(
+            kod_v3.sanitize_title("Past's Price The Resonance Cycle, Book 3 [Isekai, LitRPG]", "The Resonance Cycle", (3, "00")),
+            "Past's Price",
+        )
+
     def test_unicode_normalization_keeps_polish_matching_signal(self) -> None:
         self.assertEqual(kod_v3.normalize_match_text("Żmijewski"), "zmijewski")
         self.assertEqual(kod_v3.author_key("Łukasz Żmijewski"), "lukaszzmijewski")
@@ -80,6 +99,11 @@ class KodV3Tests(unittest.TestCase):
     def test_google_books_candidates_returns_empty_list_when_no_query_can_be_built(self) -> None:
         meta = make_meta("", title="", creators=[], identifiers=[])
         self.assertEqual(kod_v3.google_books_candidates(meta, 2.0), [])
+
+    def test_opf_candidate_skips_publisher_like_series(self) -> None:
+        candidates: list[kod_v3.Candidate] = []
+        kod_v3.add_candidate(candidates, "Pivot Press Publishing", None, 100, "opf")
+        self.assertEqual(candidates, [])
 
     def test_pick_best_online_match_marks_small_margin_as_ambiguous(self) -> None:
         meta = make_meta("Right Book", title="Right Book", creators=["Test Author"])
