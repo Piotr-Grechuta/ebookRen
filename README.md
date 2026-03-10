@@ -9,12 +9,22 @@ Windows-focused ebook renamer/copier with optional online metadata enrichment.
 - GUI by default, CLI available with `--cli`
 - Preview, apply, destination-copy mode, and undo from CSV log
 - Optional online enrichment from public catalog providers
+- Direct embedded metadata parsing is currently implemented for `epub`; other supported extensions rely on filename heuristics and optional online lookup
 
 ## Filename pattern
 
 The tool generates names in this form:
 
 `Author - Series - Tom XX.YY - Title.ext`
+
+When the tool can infer a broad genre from EPUB subjects or online catalog metadata, it appends it to the title:
+
+`Author - Series - Tom XX.YY - Title [genre].ext`
+
+## Format support
+
+- `epub`: reads embedded metadata (`title`, `creator`, `identifier`, `subject`, selected series fields)
+- `mobi`, `azw`, `azw3`, `pdf`, `lit`, `fb2`, `rtf`, `txt`: currently normalized from filename parsing plus optional online enrichment
 
 ## Requirements
 

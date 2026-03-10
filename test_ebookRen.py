@@ -1,4 +1,5 @@
 import csv
+import json
 import importlib.util
 import re
 import sys
@@ -10,14 +11,27 @@ from pathlib import Path
 from unittest import mock
 
 
-MODULE_PATH = Path(__file__).with_name("ebookRen.py")
-SPEC = importlib.util.spec_from_file_location("ebookRen", MODULE_PATH)
+MODULE_PATH = Path(__file__).with_name("app_runtime.py")
+SPEC = importlib.util.spec_from_file_location("app_runtime", MODULE_PATH)
 kod_v3 = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(kod_v3)
 
+CLI_MODULE_PATH = Path(__file__).with_name("app_cli.py")
+CLI_SPEC = importlib.util.spec_from_file_location("app_cli", CLI_MODULE_PATH)
+app_cli = importlib.util.module_from_spec(CLI_SPEC)
+assert CLI_SPEC and CLI_SPEC.loader
+CLI_SPEC.loader.exec_module(app_cli)
 
-def make_meta(stem: str, *, title: str = "", creators: list[str] | None = None, identifiers: list[str] | None = None):
+
+def make_meta(
+    stem: str,
+    *,
+    title: str = "",
+    creators: list[str] | None = None,
+    identifiers: list[str] | None = None,
+    subjects: list[str] | None = None,
+):
     segments = [kod_v3.clean(part) for part in re.split(r"\s*--\s*", stem) if kod_v3.clean(part)]
     meta = kod_v3.EpubMetadata(
         path=Path(stem + ".epub"),
@@ -28,6 +42,7 @@ def make_meta(stem: str, *, title: str = "", creators: list[str] | None = None, 
     meta.title = title
     meta.creators = list(creators or [])
     meta.identifiers = list(identifiers or [])
+    meta.subjects = list(subjects or [])
     return meta
 
 
@@ -87,6 +102,63 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(best_series.volume, (3, "00"))
         self.assertEqual(best_title.title_override, "The Eldritch Artisan")
 
+    def test_collect_title_candidates_parses_polish_dotted_series_book_format(self) -> None:
+        candidates: list[kod_v3.Candidate] = []
+        kod_v3.collect_title_candidates("Czarny mag. Tom 2. Adeptka", candidates)
+        best_series = kod_v3.choose_series_candidate(candidates)
+        best_title = kod_v3.choose_title_candidate(candidates)
+        self.assertIsNotNone(best_series)
+        self.assertIsNotNone(best_title)
+        assert best_series is not None
+        assert best_title is not None
+        self.assertEqual(best_series.series, "Czarny mag")
+        self.assertEqual(best_series.volume, (2, "00"))
+
+    def test_collect_title_candidates_parses_leading_index_dotted_series_title(self) -> None:
+        candidates: list[kod_v3.Candidate] = []
+        kod_v3.collect_title_candidates("01. Legenda. Rebeliant", candidates)
+        best_series = kod_v3.choose_series_candidate(candidates)
+        best_title = kod_v3.choose_title_candidate(candidates)
+        self.assertIsNotNone(best_series)
+        self.assertIsNotNone(best_title)
+        assert best_series is not None
+        assert best_title is not None
+        self.assertEqual(best_series.series, "Legenda")
+        self.assertEqual(best_series.volume, (1, "00"))
+        self.assertEqual(best_series.title_override, "Rebeliant")
+        self.assertEqual(best_title.title_override, "Rebeliant")
+
+    def test_collect_title_candidates_parses_series_with_parenthetical_volume_only(self) -> None:
+        candidates: list[kod_v3.Candidate] = []
+        kod_v3.collect_title_candidates("Mroczne umysły (tom 1)", candidates)
+        best_series = kod_v3.choose_series_candidate(candidates)
+        self.assertIsNotNone(best_series)
+        assert best_series is not None
+        self.assertEqual(best_series.series, "Mroczne umysły")
+        self.assertEqual(best_series.volume, (1, "00"))
+
+    def test_collect_title_candidates_supports_unicode_czesc_marker(self) -> None:
+        candidates: list[kod_v3.Candidate] = []
+        kod_v3.collect_title_candidates("Saga. Część 2. Finał", candidates)
+        best_series = kod_v3.choose_series_candidate(candidates)
+        best_title = kod_v3.choose_title_candidate(candidates)
+        self.assertIsNotNone(best_series)
+        self.assertIsNotNone(best_title)
+        assert best_series is not None
+        assert best_title is not None
+        self.assertEqual(best_series.series, "Saga")
+        self.assertEqual(best_series.volume, (2, "00"))
+        self.assertEqual(best_title.title_override, "Finał")
+
+    def test_collect_title_candidates_supports_unicode_ksiega_marker(self) -> None:
+        candidates: list[kod_v3.Candidate] = []
+        kod_v3.collect_title_candidates("Opowieść (Księga 3)", candidates)
+        best_series = kod_v3.choose_series_candidate(candidates)
+        self.assertIsNotNone(best_series)
+        assert best_series is not None
+        self.assertEqual(best_series.series, "Opowieść")
+        self.assertEqual(best_series.volume, (3, "00"))
+
     def test_sanitize_title_strips_trailing_roman_volume_suffix(self) -> None:
         self.assertEqual(
             kod_v3.sanitize_title("Chronicle (Tom IV)", "Cykl", (4, "00")),
@@ -108,6 +180,12 @@ class KodV3Tests(unittest.TestCase):
     def test_unicode_normalization_keeps_polish_matching_signal(self) -> None:
         self.assertEqual(kod_v3.normalize_match_text("Żmijewski"), "zmijewski")
         self.assertEqual(kod_v3.author_key("Łukasz Żmijewski"), "lukaszzmijewski")
+
+    def test_infer_book_genre_prefers_fantasy_over_young_adult(self) -> None:
+        self.assertEqual(
+            kod_v3.infer_book_genre(["Young Adult Fiction / Fantasy / Dark Fantasy"]),
+            "fantasy",
+        )
 
     def test_clean_normalizes_compact_series_volume_title_pattern(self) -> None:
         self.assertEqual(
@@ -136,9 +214,32 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.volume, (1, "00"))
         self.assertEqual(record.title, "Dom Ziemi")
 
+    def test_filename_appends_genre_suffix(self) -> None:
+        record = kod_v3.BookRecord(
+            path=Path("x.epub"),
+            author="Author",
+            series="Series",
+            volume=(1, "00"),
+            title="Title",
+            source="test",
+            identifiers=[],
+            notes=[],
+            genre="fantasy",
+        )
+        self.assertEqual(record.filename, "Author - Series - Tom 01.00 - Title [fantasy].epub")
+
     def test_google_books_candidates_returns_empty_list_when_no_query_can_be_built(self) -> None:
         meta = make_meta("", title="", creators=[], identifiers=[])
         self.assertEqual(kod_v3.google_books_candidates(meta, 2.0), [])
+
+    def test_infer_record_uses_local_subjects_for_genre(self) -> None:
+        meta = make_meta(
+            "Some Series 01 Some Title -- Author Name",
+            subjects=["Young Adult Fiction / Fantasy / Dark Fantasy"],
+        )
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+        self.assertEqual(record.genre, "fantasy")
+        self.assertTrue(record.filename.endswith("Some Title [fantasy].epub"))
 
     def test_opf_candidate_skips_publisher_like_series(self) -> None:
         candidates: list[kod_v3.Candidate] = []
@@ -184,6 +285,24 @@ class KodV3Tests(unittest.TestCase):
         )
         self.assertEqual(value, "A Dream of Wings & Flame A LitRPG Adventure")
 
+    def test_sanitize_title_for_online_query_strips_leading_volume_marker(self) -> None:
+        value = kod_v3.sanitize_title_for_online_query(
+            "01. Mroczne umysły",
+            "Alexandra Bracken",
+            "Standalone",
+            (0, "00"),
+        )
+        self.assertEqual(value, "Mroczne umysły")
+
+    def test_sanitize_title_for_online_query_strips_hash_prefixed_volume_marker(self) -> None:
+        value = kod_v3.sanitize_title_for_online_query(
+            "#2 Pigulki namietnosci",
+            "Cyril M. Kornbluth",
+            "Dwa Swiaty",
+            (2, "00"),
+        )
+        self.assertEqual(value, "Pigulki namietnosci")
+
     def test_build_online_query_variants_uses_author_embedded_in_title(self) -> None:
         meta = make_meta("x")
         record = kod_v3.BookRecord(
@@ -202,6 +321,24 @@ class KodV3Tests(unittest.TestCase):
         variants = kod_v3.build_online_query_variants(meta, record)
         self.assertTrue(any("Plamann Cale" in " | ".join(variant.creators) or "Cale Plamann" in " | ".join(variant.creators) for variant in variants))
         self.assertTrue(any(variant.title == "A Dream of Wings & Flame A LitRPG Adventure" for variant in variants))
+
+    def test_build_online_query_variants_normalizes_existing_format_author_for_search(self) -> None:
+        meta = make_meta("x")
+        record = kod_v3.BookRecord(
+            path=Path("x.epub"),
+            author="Aveyard Victoria",
+            series="Czerwona Królowa",
+            volume=(3, "00"),
+            title="Królewska klatka",
+            source="existing-format",
+            identifiers=[],
+            notes=[],
+            confidence=90,
+            review_reasons=[],
+            decision_reasons=[],
+        )
+        variants = kod_v3.build_online_query_variants(meta, record)
+        self.assertTrue(any("Victoria Aveyard" in variant.creators for variant in variants))
 
     def test_strip_source_artifacts_removes_numeric_suffix(self) -> None:
         self.assertEqual(kod_v3.strip_source_artifacts("Title - libgen.li (1)"), "Title")
@@ -362,6 +499,20 @@ class KodV3Tests(unittest.TestCase):
         self.assertTrue(verification.volume_confirmed)
         self.assertTrue(verification.title_confirmed)
 
+    def test_filename_preserves_unknown_series_and_volume_placeholders(self) -> None:
+        record = kod_v3.BookRecord(
+            path=Path("book.epub"),
+            author="Bracken Alexandra",
+            series="Standalone",
+            volume=None,
+            title="Po zmierzchu",
+            source="fallback",
+            identifiers=[],
+            notes=[],
+            genre="fantasy",
+        )
+        self.assertEqual(record.filename, "Bracken Alexandra - Standalone - Tom 00.00 - Po zmierzchu [fantasy].epub")
+
     def test_existing_format_with_standalone_and_zero_volume_still_allows_online_series_upgrade(self) -> None:
         meta = make_meta("Carter Rachel E - Standalone - Tom 00.00 - 01. Pierwszy rok")
         online_candidates = [
@@ -380,6 +531,204 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.author, "Carter Rachel E")
         self.assertEqual(record.series, "The Black Mage")
         self.assertEqual(record.volume, (1, "00"))
+
+    def test_unknown_volume_from_fallback_is_filled_from_online_series_match(self) -> None:
+        meta = make_meta(
+            "01. Czerwona Kr?lowa - Victoria Aveyard",
+            title="01. Czerwona Kr?lowa",
+            creators=["Victoria Aveyard"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac",
+                "Czerwona Kr?lowa",
+                ["Victoria Aveyard"],
+                [],
+                320,
+                "title-author-exact",
+                series="Czerwona Kr?lowa",
+                volume=(1, "00"),
+                genre="fantasy",
+            )
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0)
+        self.assertEqual(record.series, "Czerwona Kr?lowa")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.filename, "Aveyard Victoria - Czerwona Kr-lowa - Tom 01.00 - Czerwona Kr-lowa [fantasy].epub")
+
+    def test_existing_format_with_lubimyczytac_series_metadata_upgrades_polish_title(self) -> None:
+        meta = make_meta(
+            "Bracken Alexandra - Standalone - Tom 00.00 - 01. Mroczne umysły",
+            creators=["Alexandra Bracken"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac",
+                "Mroczne umysły",
+                ["Alexandra Bracken"],
+                [],
+                252,
+                "title-author-approx",
+                series="Mroczne umysły",
+                volume=(1, "00"),
+            )
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0)
+        self.assertEqual(record.author, "Bracken Alexandra")
+        self.assertEqual(record.series, "Mroczne umysły")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.title, "Mroczne umysły")
+
+    def test_lubimyczytac_title_overrides_hash_prefixed_local_title(self) -> None:
+        meta = make_meta(
+            "#2 Pigulki namietnosci - Cyril M. Kornbluth",
+            title="#2 Pigulki namietnosci",
+            creators=["Cyril M. Kornbluth"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "google-books",
+                "google-books",
+                "Dwa Swiaty. #2 Pigulki namietnosci",
+                ["Cyril M. Kornbluth"],
+                [],
+                260,
+                "title-author-approx",
+                series="Dwa Swiaty",
+                volume=(2, "00"),
+                genre="fantasy",
+            ),
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac",
+                "Pigulki namietnosci",
+                ["Cyril M. Kornbluth"],
+                [],
+                252,
+                "title-author-approx",
+                series="Dwa Swiaty",
+                volume=(2, "00"),
+                genre="fantasy",
+            ),
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["google", "lubimyczytac"], timeout=1.0)
+        self.assertEqual(record.series, "Dwa Swiaty")
+        self.assertEqual(record.volume, (2, "00"))
+        self.assertEqual(record.title, "Pigulki namietnosci")
+        self.assertNotIn("#2", record.filename)
+
+    def test_online_context_filter_rejects_alien_series_for_known_book(self) -> None:
+        meta = make_meta(
+            "Aveyard Victoria - Standalone - Tom 00.00 - 04. Wojenna burza",
+            creators=["Victoria Aveyard"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac",
+                "2001: Odyseja kosmiczna",
+                ["Arthur C. Clarke"],
+                [],
+                260,
+                "title-author-approx",
+                series="Odyseja Kosmiczna",
+                volume=(2, "00"),
+            )
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0)
+        self.assertEqual(record.series, "Standalone")
+        self.assertEqual(record.volume, (0, "00"))
+        self.assertEqual(record.title, "04. Wojenna burza")
+
+    def test_existing_format_with_wrong_volume_can_be_corrected_online(self) -> None:
+        meta = make_meta(
+            "Aveyard Victoria - Czerwona Królowa - Tom 02.00 - Wojenna burza",
+            creators=["Victoria Aveyard"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "open-library",
+                "open-library:search",
+                "Wojenna burza",
+                ["Victoria Aveyard"],
+                [],
+                320,
+                "title-author-exact",
+                series="Czerwona Królowa",
+                volume=(4, "00"),
+            )
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["openlibrary"], timeout=1.0)
+        self.assertEqual(record.series, "Czerwona Królowa")
+        self.assertEqual(record.volume, (4, "00"))
+        self.assertEqual(record.title, "Wojenna burza")
+
+    def test_existing_format_with_alien_series_is_corrected_from_contextual_online_match(self) -> None:
+        meta = make_meta(
+            "Bracken Alexandra - Odyseja Kosmiczna - Tom 02.00 - Nigdy nie gasn? [fantasy]",
+            creators=["Alexandra Bracken"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac",
+                "Nigdy nie gasn?",
+                ["Alexandra Bracken"],
+                [],
+                252,
+                "title-author-approx",
+                series="Mroczne umys?y",
+                volume=(2, "00"),
+                genre="fantasy",
+            ),
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac",
+                "Odyseja kosmiczna 2010",
+                ["Arthur C. Clarke"],
+                [],
+                166,
+                "approx",
+                series="Odyseja Kosmiczna",
+                volume=(2, "00"),
+                genre="sci-fi",
+            ),
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0)
+        self.assertEqual(record.series, "Mroczne umys?y")
+        self.assertEqual(record.volume, (2, "00"))
+        self.assertEqual(record.title, "Nigdy nie gasn?")
+        self.assertEqual(record.genre, "fantasy")
+
+    def test_parse_existing_filename_preserves_trailing_genre_suffix(self) -> None:
+        parsed = kod_v3.parse_existing_filename("Author - Series - Tom 01.00 - Title [fantasy]")
+        self.assertEqual(parsed, ("Author", "Series", (1, "00"), "Title", "fantasy"))
+
+    def test_parse_existing_filename_rejects_parenthesized_index_prefix_as_author(self) -> None:
+        parsed = kod_v3.parse_existing_filename("(03) - Burzowe Kocie - Maja Lidia Kossakowska")
+        self.assertIsNone(parsed)
+
+    def test_infer_record_handles_parenthesized_index_title_author_pattern(self) -> None:
+        meta = make_meta(
+            "(03) - Burzowe Kocie - Maja Lidia Kossakowska",
+            subjects=["fantasy"],
+        )
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+        self.assertEqual(record.author, "Kossakowska Maja Lidia")
+        self.assertEqual(record.series, "Standalone")
+        self.assertEqual(record.title, "Burzowe Kocie")
+        self.assertEqual(
+            record.filename,
+            "Kossakowska Maja Lidia - Standalone - Tom 00.00 - Burzowe Kocie [fantasy].epub",
+        )
 
     def test_online_applied_does_not_force_review(self) -> None:
         meta = make_meta("Series 1: Title", creators=["Known Author"])
@@ -436,14 +785,128 @@ class KodV3Tests(unittest.TestCase):
         assert best is not None
         self.assertIn("best-effort", best.reason)
 
+    def test_strong_lubimyczytac_confirmation_clears_best_effort_review(self) -> None:
+        meta = make_meta(
+            "Aveyard Victoria - Czerwona Kr?lowa - Tom 00.00 - Czerwona Kr?lowa [fantasy]",
+            title="01. Czerwona Kr?lowa",
+            creators=["Victoria Aveyard"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac",
+                "Czerwona Kr?lowa",
+                ["Victoria Aveyard"],
+                [],
+                320,
+                "title-author-exact",
+                series="Czerwona Kr?lowa",
+                volume=(1, "00"),
+                genre="fantasy",
+            )
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0)
+        self.assertEqual(record.series, "Czerwona Kr?lowa")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertNotIn("online-best-effort", record.review_reasons)
+        self.assertNotIn("online-niejednoznaczne", record.review_reasons)
+        self.assertFalse(record.needs_review)
+
     def test_lubimyczytac_html_parser_extracts_title_and_author(self) -> None:
         parser = kod_v3.LubimyczytacSearchParser()
         parser.feed(
             '<a class="authorAllBooks__singleTextTitle" href="/x">Bibliomancer</a>'
             '<div class="authorAllBooks__singleTextAuthor"><a href="/a">James Hunter</a></div>'
+            '<div class="listLibrary__info listLibrary__info--cycles"><a href="/c">Wolfman Warlock (tom 1)</a></div>'
         )
         parser.close()
-        self.assertEqual(parser.results, [("Bibliomancer", ["James Hunter"])])
+        self.assertEqual(
+            parser.results,
+            [kod_v3.LubimyczytacResult("Bibliomancer", ["James Hunter"], "Wolfman Warlock", (1, "00"), "/x")],
+        )
+
+    def test_parse_lubimyczytac_detail_page_extracts_cycle_and_genre(self) -> None:
+        page = (
+            '<span class="d-none d-sm-block mt-1"> Cykl:'
+            '<a href="/cykl/4826/czerwona-krolowa"> Czerwona Kr?lowa (tom 3) </a></span>'
+            '<a class="book__category d-sm-block d-none" href="/kategoria/beletrystyka/fantasy-science-fiction">'
+            ' fantasy, science fiction </a>'
+        )
+        series, volume, genres = kod_v3.parse_lubimyczytac_detail_page(page)
+        self.assertEqual(series, "Czerwona Kr?lowa")
+        self.assertEqual(volume, (3, "00"))
+        self.assertEqual(genres, ["fantasy, science fiction"])
+
+    def test_parse_lubimyczytac_detail_page_prefers_cycle_over_series_label(self) -> None:
+        page = (
+            '<span class="d-none d-sm-block mt-1"> Cykl:'
+            '<a href="/cykl/1/cycle-name"> Cycle Name (tom 2) </a></span>'
+            '<span class="d-none d-sm-block mt-1"> Seria:'
+            '<a href="/seria/1/series-name"> Series Name </a></span>'
+        )
+        series, volume, genres = kod_v3.parse_lubimyczytac_detail_page(page)
+        self.assertEqual(series, "Cycle Name")
+        self.assertEqual(volume, (2, "00"))
+        self.assertEqual(genres, [])
+
+    def test_lubimyczytac_candidates_enrich_from_detail_page(self) -> None:
+        meta = make_meta("Kr?lewska klatka", creators=["Victoria Aveyard"])
+        search_page = (
+            '<a class="authorAllBooks__singleTextTitle" href="/ksiazka/4404787/krolewska-klatka"> Kr?lewska klatka </a>'
+            '<div class="authorAllBooks__singleTextAuthor"><a href="/autor/72769/victoria-aveyard">Victoria Aveyard</a></div>'
+        )
+        detail_page = (
+            '<span class="d-none d-sm-block mt-1"> Cykl:<a href="/cykl/4826/czerwona-krolowa"> Czerwona Kr?lowa (tom 3) </a></span>'
+            '<a class="book__category d-sm-block d-none" href="/kategoria/beletrystyka/fantasy-science-fiction"> fantasy, science fiction </a>'
+        )
+        with mock.patch.object(
+            kod_v3,
+            "online_text_query",
+            side_effect=lambda url, timeout: detail_page if "ksiazka/4404787" in url else search_page,
+        ):
+            candidates = kod_v3.lubimyczytac_candidates(meta, 2.0)
+        self.assertTrue(candidates)
+        best = max(candidates, key=lambda item: item.score)
+        self.assertEqual(best.series, "Czerwona Kr?lowa")
+        self.assertEqual(best.volume, (3, "00"))
+        self.assertEqual(best.genre, "fantasy")
+
+    def test_build_lubimyczytac_query_terms_uses_author_surname_and_title_fallbacks(self) -> None:
+        meta = make_meta("01. Czerwona Krlowa", creators=["Victoria Aveyard"], title="01. Czerwona Krlowa")
+        terms = kod_v3.build_lubimyczytac_query_terms(meta)
+        self.assertEqual(terms[:2], ["Aveyard Czerwona Krlowa", "Victoria Czerwona Krlowa"])
+        self.assertIn("Czerwona Krlowa", terms)
+
+    def test_lubimyczytac_candidates_use_calibre_style_author_query_for_polish_titles(self) -> None:
+        meta = make_meta("01. Czerwona Krlowa", creators=["Victoria Aveyard"], title="01. Czerwona Krlowa")
+        search_page = (
+            '<a class="authorAllBooks__singleTextTitle" href="/ksiazka/5182124/czerwona-krolowa"> Czerwona Krlowa </a>'
+            '<div class="authorAllBooks__singleTextAuthor"><a href="/autor/72769/victoria-aveyard">Victoria Aveyard</a></div>'
+        )
+        detail_page = (
+            '<span class="d-none d-sm-block mt-1"> Cykl:<a href="/cykl/4826/czerwona-krolowa"> Czerwona Krlowa (tom 1) </a></span>'
+            '<a class="book__category d-sm-block d-none" href="/kategoria/beletrystyka/fantasy-science-fiction"> fantasy, science fiction </a>'
+        )
+        seen_urls: list[str] = []
+
+        def fake_online_text_query(url: str, timeout: float) -> str:
+            seen_urls.append(url)
+            if "ksiazka/5182124" in url:
+                return detail_page
+            return search_page
+
+        with mock.patch.object(kod_v3, "online_text_query", side_effect=fake_online_text_query):
+            candidates = kod_v3.lubimyczytac_candidates(meta, 2.0)
+
+        self.assertTrue(candidates)
+        best = max(candidates, key=lambda item: item.score)
+        self.assertEqual(best.series, "Czerwona Krlowa")
+        self.assertEqual(best.volume, (1, "00"))
+        self.assertTrue(
+            any("phrase=Aveyard+Czerwona+Kr" in url for url in seen_urls),
+            seen_urls,
+        )
 
     def test_online_cache_persists_to_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -458,6 +921,59 @@ class KodV3Tests(unittest.TestCase):
                 kod_v3.load_online_cache()
                 with kod_v3.ONLINE_CACHE_LOCK:
                     self.assertEqual(kod_v3.ONLINE_CACHE["https://example.test"], {"ok": True})
+
+    def test_save_online_cache_skips_large_text_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "cache.json"
+            with mock.patch.object(kod_v3, "ONLINE_CACHE_PATH", cache_path):
+                with kod_v3.ONLINE_CACHE_LOCK:
+                    kod_v3.ONLINE_CACHE.clear()
+                    kod_v3.ONLINE_CACHE["json:https://example.test"] = {"ok": True}
+                    kod_v3.ONLINE_CACHE["text:https://example.test"] = "<html>big</html>"
+                    kod_v3.ONLINE_CACHE_DIRTY = True
+                    kod_v3.ONLINE_CACHE_PENDING_WRITES = 1
+                kod_v3.save_online_cache()
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload, {"json:https://example.test": {"ok": True}})
+
+    def test_load_online_cache_prunes_text_entries_and_marks_cache_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "cache.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "json:https://example.test": {"ok": True},
+                        "text:https://example.test": "<html>big</html>",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(kod_v3, "ONLINE_CACHE_PATH", cache_path):
+                with kod_v3.ONLINE_CACHE_LOCK:
+                    kod_v3.ONLINE_CACHE.clear()
+                    kod_v3.ONLINE_CACHE_DIRTY = False
+                    kod_v3.ONLINE_CACHE_PENDING_WRITES = 0
+                kod_v3.load_online_cache()
+                with kod_v3.ONLINE_CACHE_LOCK:
+                    self.assertEqual(kod_v3.ONLINE_CACHE, {"json:https://example.test": {"ok": True}})
+                    self.assertTrue(kod_v3.ONLINE_CACHE_DIRTY)
+                    self.assertEqual(kod_v3.ONLINE_CACHE_PENDING_WRITES, 1)
+
+    def test_reserve_lubimyczytac_request_delay_adds_non_uniform_spacing(self) -> None:
+        with mock.patch.object(kod_v3.random, "uniform", side_effect=[2.5, 4.0]):
+            with kod_v3.LUBIMYCZYTAC_RATE_LOCK:
+                kod_v3.LUBIMYCZYTAC_NEXT_REQUEST_AT = 0.0
+            first_delay = kod_v3.reserve_lubimyczytac_request_delay(now=10.0)
+            second_delay = kod_v3.reserve_lubimyczytac_request_delay(now=11.0)
+        self.assertEqual(first_delay, 0.0)
+        self.assertEqual(second_delay, 1.5)
+        with kod_v3.LUBIMYCZYTAC_RATE_LOCK:
+            self.assertEqual(kod_v3.LUBIMYCZYTAC_NEXT_REQUEST_AT, 16.5)
+
+    def test_build_online_request_uses_browser_headers_for_lubimyczytac(self) -> None:
+        request = kod_v3.build_online_request("https://lubimyczytac.pl/szukaj/ksiazki?phrase=test")
+        self.assertEqual(request.headers["Referer"], "https://lubimyczytac.pl/")
+        self.assertIn("Mozilla/5.0", request.headers["User-agent"])
 
     def test_flush_online_cache_if_needed_respects_buffer_until_forced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -475,10 +991,10 @@ class KodV3Tests(unittest.TestCase):
                 self.assertTrue(cache_path.exists())
 
     def test_online_fetch_caches_failures_temporarily(self) -> None:
-        with mock.patch.object(kod_v3.urllib.request, "urlopen", side_effect=OSError("timeout")) as urlopen:
+        with mock.patch.object(kod_v3.ONLINE_HTTP_OPENER, "open", side_effect=OSError("timeout")) as opener:
             self.assertIsNone(kod_v3.online_fetch("https://example.test", 1.0, kind="json"))
             self.assertIsNone(kod_v3.online_fetch("https://example.test", 1.0, kind="json"))
-        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(opener.call_count, 1)
 
     def test_save_online_cache_keeps_dirty_flags_on_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -551,9 +1067,8 @@ class KodV3Tests(unittest.TestCase):
             self.assertGreater(len(thread_ids), 1)
 
     def test_main_uses_gui_by_default(self) -> None:
-        with mock.patch.object(sys, "argv", ["ebookRen.py"]):
-            with mock.patch.object(kod_v3, "launch_gui", return_value=0) as launch_gui:
-                code = kod_v3.main()
+        with mock.patch.object(app_cli.app_gui, "launch_gui", return_value=0) as launch_gui:
+            code = app_cli.main([])
         self.assertEqual(code, 0)
         launch_gui.assert_called_once()
         self.assertEqual(launch_gui.call_args.args[0], kod_v3.DEFAULT_SOURCE_FOLDER)
@@ -561,31 +1076,26 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(launch_gui.call_args.args[-1], 2)
 
     def test_main_passes_online_flag_to_gui_default(self) -> None:
-        with mock.patch.object(sys, "argv", ["ebookRen.py", "--online"]):
-            with mock.patch.object(kod_v3, "launch_gui", return_value=0) as launch_gui:
-                code = kod_v3.main()
+        with mock.patch.object(app_cli.app_gui, "launch_gui", return_value=0) as launch_gui:
+            code = app_cli.main(["--online"])
         self.assertEqual(code, 0)
         self.assertEqual(launch_gui.call_args.args[-2], True)
 
     def test_parser_accepts_cli_and_apply_flags(self) -> None:
-        with mock.patch.object(sys, "argv", ["ebookRen.py", "--cli", "--apply"]):
-            args = kod_v3.parse_args()
+        args = app_cli.parse_args(["--cli", "--apply"])
         self.assertTrue(args.cli)
         self.assertTrue(args.apply)
 
     def test_parser_rejects_apply_and_dry_run_together(self) -> None:
-        with mock.patch.object(sys, "argv", ["ebookRen.py", "--apply", "--dry-run"]):
-            with self.assertRaises(SystemExit):
-                kod_v3.parse_args()
+        with self.assertRaises(SystemExit):
+            app_cli.parse_args(["--apply", "--dry-run"])
 
     def test_parser_accepts_online_workers_flag(self) -> None:
-        with mock.patch.object(sys, "argv", ["ebookRen.py", "--cli", "--online-workers", "2"]):
-            args = kod_v3.parse_args()
+        args = app_cli.parse_args(["--cli", "--online-workers", "2"])
         self.assertEqual(args.online_workers, 2)
 
     def test_parser_defaults_match_requested_gui_profile(self) -> None:
-        with mock.patch.object(sys, "argv", ["ebookRen.py"]):
-            args = kod_v3.parse_args()
+        args = app_cli.parse_args([])
         self.assertEqual(args.folder, kod_v3.DEFAULT_SOURCE_FOLDER)
         self.assertFalse(args.online)
         self.assertEqual(args.online_workers, 2)
@@ -610,6 +1120,46 @@ class KodV3Tests(unittest.TestCase):
             plan = kod_v3.build_undo_plan(report_path, folder)
             self.assertEqual(plan.moves[0].source.name, " Target-.epub ")
             self.assertEqual(plan.moves[0].destination.name, " Book-.epub ")
+
+    def test_build_undo_plan_copy_uses_temp_backup_for_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            report_path = folder / "log.csv"
+            with report_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle, delimiter=";")
+                writer.writerow(["source_name", "target_name", "source_folder", "target_folder", "operation", "mode", "execution_status"])
+                writer.writerow(["Source.epub", "Target.epub", str(folder), str(folder), "copy", "apply", "copied"])
+            plan = kod_v3.build_undo_plan(report_path, folder)
+            self.assertEqual(plan.moves[0].operation, "delete")
+            self.assertIsNotNone(plan.moves[0].temp)
+            assert plan.moves[0].temp is not None
+            self.assertIn("__tmp_undo_delete_", plan.moves[0].temp.name)
+
+    def test_execute_moves_delete_restores_files_when_delete_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source_a = folder / "A.epub"
+            source_b = folder / "B.epub"
+            source_a.write_text("A", encoding="utf-8")
+            source_b.write_text("B", encoding="utf-8")
+            move_a = kod_v3.RenameMove(source_a, folder / "__tmp_undo_delete_0001.epub", folder / "ignored-A.epub", None, "delete")
+            move_b = kod_v3.RenameMove(source_b, folder / "__tmp_undo_delete_0002.epub", folder / "ignored-B.epub", None, "delete")
+
+            original_unlink = Path.unlink
+
+            def flaky_unlink(path_obj: Path, *args, **kwargs):
+                if path_obj == source_b:
+                    raise OSError("locked")
+                return original_unlink(path_obj, *args, **kwargs)
+
+            with mock.patch.object(Path, "unlink", new=flaky_unlink):
+                errors = kod_v3.execute_moves([move_a, move_b])
+
+            self.assertTrue(errors)
+            self.assertTrue(source_a.exists())
+            self.assertTrue(source_b.exists())
+            self.assertFalse(move_a.temp.exists())
+            self.assertFalse(move_b.temp.exists())
 
     def test_review_required_records_are_processed_in_apply_mode(self) -> None:
         with tempfile.TemporaryDirectory() as src_tmp, tempfile.TemporaryDirectory() as dst_tmp:
