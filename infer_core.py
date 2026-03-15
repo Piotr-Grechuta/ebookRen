@@ -92,10 +92,10 @@ def split_title_genre_suffix(title: str, *, genre_suffix_re) -> tuple[str, str]:
     match = genre_suffix_re.match(cleaned)
     if not match:
         return cleaned, ""
-    normalized_genre = infer_book_genre([match.group(2)]) or clean(match.group(2))
-    if not normalized_genre:
+    parsed_genre = clean(match.group(2))
+    if not parsed_genre:
         return cleaned, ""
-    return clean(match.group(1)), normalized_genre
+    return clean(match.group(1)), parsed_genre
 
 
 def format_title_with_genre(title: str, genre: str, *, genre_suffix_re) -> str:

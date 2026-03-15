@@ -708,26 +708,31 @@ def validate_record_components_with_online(
                 record.decision_reasons.append("online-role-volume:yes")
                 record.online_applied = True
 
-    if not record.genre:
-        best_genre = next(
-            (
-                clean(candidate.genre)
-                for candidate in sorted(supporting_online_candidates, key=lambda item: item.score, reverse=True)
-                if candidate_genre_matches_record(
-                    candidate,
-                    record,
-                    split_authors=split_authors,
-                    normalize_match_text=normalize_match_text,
-                    similarity_score=similarity_score,
-                    clean=clean,
-                )
-            ),
-            "",
-        )
-        if best_genre:
+    best_genre = next(
+        (
+            clean(candidate.genre)
+            for candidate in sorted(supporting_online_candidates, key=lambda item: item.score, reverse=True)
+            if candidate_genre_matches_record(
+                candidate,
+                record,
+                split_authors=split_authors,
+                normalize_match_text=normalize_match_text,
+                similarity_score=similarity_score,
+                clean=clean,
+            )
+        ),
+        "",
+    )
+    if best_genre:
+        if not record.genre:
             record.genre = best_genre
             record.notes.append("online-role-genre:applied")
             record.decision_reasons.append("online-role-genre:yes")
+            record.online_applied = True
+        elif record.source == "existing-format" and normalize_match_text(record.genre) != normalize_match_text(best_genre):
+            record.genre = best_genre
+            record.notes.append("online-role-genre:replaced")
+            record.decision_reasons.append("online-role-genre:replaced")
             record.online_applied = True
 
     return verification_type(
@@ -858,7 +863,7 @@ def infer_record(
             series=series or "Standalone",
             volume=volume,
             title=title or "Bez tytulu",
-            genre=infer_book_genre(meta.subjects),
+            genre=clean(genre) or infer_book_genre(meta.subjects),
             source="existing-format",
             confidence=100,
             title_from_core=False,

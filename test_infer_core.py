@@ -21,6 +21,16 @@ class InferCoreTests(unittest.TestCase):
             "Title [sci-fi]",
         )
 
+    def test_split_title_genre_suffix_preserves_full_label(self) -> None:
+        genre_suffix_re = __import__("re").compile(r"^(.*?)\s*\[([^\[\]]+)\]\s*$")
+        self.assertEqual(
+            infer_core.split_title_genre_suffix(
+                "Title [kryminał, sensacja, thriller]",
+                genre_suffix_re=genre_suffix_re,
+            ),
+            ("Title", "kryminał, sensacja, thriller"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

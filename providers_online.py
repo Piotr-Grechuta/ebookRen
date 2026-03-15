@@ -182,13 +182,15 @@ def parse_lubimyczytac_detail_page(
 
     for pattern in (
         r'class="book__category[^"]*"[^>]*>\s*([^<]+?)\s*</a>',
-        r'<a[^>]+href="/kategoria/[^"]+"[^>]*>\s*([^<]+?)\s*</a>',
         r"Kategoria:\s*</dt>\s*<dd[^>]*>\s*<a[^>]*>\s*([^<]+?)\s*</a>",
+        r'<a[^>]+href="/kategoria/[^"]+"[^>]*>\s*([^<]+?)\s*</a>',
     ):
         for match in re.finditer(pattern, page, flags=re.IGNORECASE | re.DOTALL):
             label = clean(html.unescape(strip_html_tags(match.group(1))))
             if label and label not in genres:
                 genres.append(label)
+        if genres:
+            break
 
     return series, volume, genres
 
@@ -418,15 +420,11 @@ def lubimyczytac_candidates(
     candidate_type,
 ) -> list:
     def resolve_lubimyczytac_genre(labels: list[str]) -> str:
-        normalized = infer_book_genre(labels)
-        if normalized:
-            return normalized
         for label in labels:
             cleaned_label = clean(label)
             if not cleaned_label:
                 continue
-            primary_label = clean(re.split(r"[,/|]", cleaned_label, maxsplit=1)[0])
-            return primary_label or cleaned_label
+            return cleaned_label
         return ""
 
     isbns = extract_isbns(meta.identifiers)

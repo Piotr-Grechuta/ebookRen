@@ -906,11 +906,11 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.series, "The Black Mage")
         self.assertEqual(record.volume, (1, "00"))
 
-    def test_existing_format_does_not_trust_genre_suffix_from_input_filename(self) -> None:
+    def test_existing_format_preserves_genre_suffix_from_input_filename_until_verified(self) -> None:
         meta = make_meta("Wisniewski-Snerg Adam - Standalone - Tom 00.00 - Nagi cel [fantasy]")
         record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
-        self.assertEqual(record.genre, "")
-        self.assertNotIn("[fantasy]", record.filename)
+        self.assertEqual(record.genre, "fantasy")
+        self.assertIn("[fantasy]", record.filename)
 
     def test_unknown_volume_from_fallback_is_filled_from_online_series_match(self) -> None:
         meta = make_meta(
@@ -1389,7 +1389,7 @@ class KodV3Tests(unittest.TestCase):
                 [],
                 320,
                 "title-author-exact",
-                genre="thriller",
+                genre="kryminał, sensacja, thriller",
             )
         ]
         with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
@@ -1398,13 +1398,36 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.title, "Tajemnica Doliny Boscombe")
         self.assertEqual(record.series, "Standalone")
         self.assertEqual(record.volume, None)
-        self.assertEqual(record.genre, "thriller")
+        self.assertEqual(record.genre, "kryminał, sensacja, thriller")
         self.assertIn("online-truth:lubimyczytac", record.decision_reasons)
         self.assertNotIn("fallback", record.review_reasons)
         self.assertEqual(
             record.filename,
-            "Doyle Arthur Conan - Standalone - Tom 00.00 - Tajemnica Doliny Boscombe [thriller].epub",
+            "Doyle Arthur Conan - Standalone - Tom 00.00 - Tajemnica Doliny Boscombe [kryminał, sensacja, thriller].epub",
         )
+
+    def test_existing_format_genre_suffix_is_replaced_when_online_verifies_different_label(self) -> None:
+        meta = make_meta(
+            "Wisniewski-Snerg Adam - Standalone - Tom 00.00 - Nagi cel [fantasy]",
+            creators=["Adam WiĹ›niewski-Snerg"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac",
+                "Nagi cel",
+                ["Adam WiĹ›niewski-Snerg"],
+                [],
+                320,
+                "title-author-exact",
+                genre="kryminaĹ‚, sensacja, thriller",
+            )
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0, online_mode="PL")
+        self.assertEqual(record.genre, "kryminaĹ‚, sensacja, thriller")
+        self.assertNotIn("[fantasy]", record.filename)
+        self.assertIn("[kryminaĹ‚, sensacja, thriller]", record.filename)
 
     def test_build_online_record_preserves_lubimyczytac_coauthor_order(self) -> None:
         meta = make_meta("Okrutny biegun")
@@ -1489,7 +1512,7 @@ class KodV3Tests(unittest.TestCase):
         best = max(candidates, key=lambda item: item.score)
         self.assertEqual(best.series, "Czerwona Kr?lowa")
         self.assertEqual(best.volume, (3, "00"))
-        self.assertEqual(best.genre, "fantasy")
+        self.assertEqual(best.genre, "fantasy, science fiction")
 
     def test_lubimyczytac_candidates_fallback_to_raw_category_when_mapping_is_unknown(self) -> None:
         meta = make_meta("Unknown Book", creators=["Author Example"])

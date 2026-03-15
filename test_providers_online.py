@@ -1,5 +1,5 @@
-import unittest
 import re
+import unittest
 
 import infer_core
 import providers_online
@@ -21,21 +21,21 @@ class ProvidersOnlineTests(unittest.TestCase):
             result_type=LubimyczytacResult,
         )
         parser.feed(
-            '<a class="authorAllBooks__singleTextTitle" href="/x">Królewska klatka</a>'
+            '<a class="authorAllBooks__singleTextTitle" href="/x">KrĂłlewska klatka</a>'
             '<div class="authorAllBooks__singleTextAuthor"><a href="/a">Victoria Aveyard</a></div>'
-            '<div class="listLibrary__info listLibrary__info--cycles"><a href="/c">Czerwona Królowa (tom 3)</a></div>'
+            '<div class="listLibrary__info listLibrary__info--cycles"><a href="/c">Czerwona KrĂłlowa (tom 3)</a></div>'
         )
         parser.close()
 
         self.assertEqual(
             parser.results,
-            [LubimyczytacResult("Królewska klatka", ["Victoria Aveyard"], "Czerwona Królowa", (3, "00"), "/x")],
+            [LubimyczytacResult("KrĂłlewska klatka", ["Victoria Aveyard"], "Czerwona KrĂłlowa", (3, "00"), "/x")],
         )
 
     def test_parse_lubimyczytac_detail_page_extracts_polish_cycle_and_categories(self) -> None:
         page = (
             '<span class="d-none d-sm-block mt-1"> Cykl:'
-            '<a href="/cykl/4826/czerwona-krolowa"> Czerwona Królowa (tom 1) </a></span>'
+            '<a href="/cykl/4826/czerwona-krolowa"> Czerwona KrĂłlowa (tom 1) </a></span>'
             '<a class="book__category d-sm-block d-none" href="/kategoria/fantasy"> fantasy </a>'
             '<a class="book__category d-sm-block d-none" href="/kategoria/science-fiction"> science fiction </a>'
         )
@@ -48,9 +48,32 @@ class ProvidersOnlineTests(unittest.TestCase):
             series_only_paren_index_re=SERIES_ONLY_PAREN_INDEX_RE,
         )
 
-        self.assertEqual(series, "Czerwona Królowa")
+        self.assertEqual(series, "Czerwona KrĂłlowa")
         self.assertEqual(volume, (1, "00"))
         self.assertEqual(genres, ["fantasy", "science fiction"])
+
+    def test_parse_lubimyczytac_detail_page_ignores_footer_categories_when_book_category_exists(self) -> None:
+        page = (
+            '<a class="book__category d-sm-block d-none" href="/kategoria/beletrystyka/kryminal-sensacja-thriller">'
+            " kryminał, sensacja, thriller </a>"
+            '<div class="footer__popular">'
+            '<a class="footer__popular-link" href="/kategoria/beletrystyka/fantasy-science-fiction">'
+            " fantasy, science fiction </a>"
+            '<a class="footer__popular-link" href="/kategoria/beletrystyka/horror"> horror </a>'
+            "</div>"
+        )
+        series, volume, genres = providers_online.parse_lubimyczytac_detail_page(
+            page,
+            clean=clean,
+            strip_html_tags=lambda text: clean(re.sub(r"<[^>]+>", " ", text or "")),
+            clean_series=clean,
+            parse_volume_parts=infer_core.parse_volume_parts,
+            series_only_paren_index_re=SERIES_ONLY_PAREN_INDEX_RE,
+        )
+
+        self.assertEqual(series, "")
+        self.assertIsNone(volume)
+        self.assertEqual(genres, ["kryminał, sensacja, thriller"])
 
     def test_fetch_online_candidates_prefers_lubimyczytac_first_in_pl_mode(self) -> None:
         calls: list[str] = []
@@ -60,6 +83,7 @@ class ProvidersOnlineTests(unittest.TestCase):
                 del meta, timeout
                 calls.append(name)
                 return results
+
             return _provider
 
         providers_online.fetch_online_candidates(
@@ -87,6 +111,7 @@ class ProvidersOnlineTests(unittest.TestCase):
                 del meta, timeout
                 calls.append(name)
                 return results
+
             return _provider
 
         providers_online.fetch_online_candidates(
