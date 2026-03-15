@@ -182,6 +182,7 @@ def parse_lubimyczytac_detail_page(
 
     for pattern in (
         r'class="book__category[^"]*"[^>]*>\s*([^<]+?)\s*</a>',
+        r'<a[^>]+href="/kategoria/[^"]+"[^>]*>\s*([^<]+?)\s*</a>',
         r"Kategoria:\s*</dt>\s*<dd[^>]*>\s*<a[^>]*>\s*([^<]+?)\s*</a>",
     ):
         for match in re.finditer(pattern, page, flags=re.IGNORECASE | re.DOTALL):
@@ -416,6 +417,18 @@ def lubimyczytac_candidates(
     infer_book_genre,
     candidate_type,
 ) -> list:
+    def resolve_lubimyczytac_genre(labels: list[str]) -> str:
+        normalized = infer_book_genre(labels)
+        if normalized:
+            return normalized
+        for label in labels:
+            cleaned_label = clean(label)
+            if not cleaned_label:
+                continue
+            primary_label = clean(re.split(r"[,/|]", cleaned_label, maxsplit=1)[0])
+            return primary_label or cleaned_label
+        return ""
+
     isbns = extract_isbns(meta.identifiers)
     terms = build_lubimyczytac_query_terms(meta)
     if not terms and isbns:
@@ -458,7 +471,7 @@ def lubimyczytac_candidates(
                     reason=reason,
                     series=clean_series(result.series),
                     volume=result.volume,
-                    genre=infer_book_genre(result.genres),
+                    genre=resolve_lubimyczytac_genre(list(result.genres)),
                 )
             )
 
@@ -472,11 +485,49 @@ def fetch_online_candidates(
     providers: list[str],
     timeout: float,
     *,
+    online_mode: str = "PL",
     provider_functions: dict[str, Callable],
     emit_provider_progress: Callable[[str, str], None] | None = None,
 ) -> list:
+    def normalize_online_mode(value: str | None) -> str:
+        mode = (value or "PL").strip().upper()
+        if mode == "PL+":
+            return "PL+"
+        if mode.startswith("PL"):
+            return "PL"
+        return "EN"
+
+    def ordered_providers(selected: list[str]) -> list[str]:
+        normalized_mode = normalize_online_mode(online_mode)
+        if normalized_mode == "PL":
+            return ["lubimyczytac"] if "lubimyczytac" in selected else []
+        elif normalized_mode == "PL+":
+            preferred_order = ["lubimyczytac", "google", "openlibrary", "crossref", "hathitrust"]
+        else:
+            preferred_order = ["google", "openlibrary", "crossref", "hathitrust", "lubimyczytac"]
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for provider in preferred_order + selected:
+            if provider in seen or provider not in selected:
+                continue
+            seen.add(provider)
+            ordered.append(provider)
+        return ordered
+
+    def is_strong_candidate(candidate) -> bool:
+        reason = getattr(candidate, "reason", "")
+        score = int(getattr(candidate, "score", 0) or 0)
+        if reason == "isbn-exact" and score >= 420:
+            return True
+        if reason == "title-author-exact" and score >= 260:
+            return True
+        if reason == "title-exact" and score >= 280:
+            return True
+        return False
+
     all_candidates: list = []
-    for provider in providers:
+    normalized_mode = normalize_online_mode(online_mode)
+    for provider in ordered_providers(providers):
         func = provider_functions.get(provider)
         if func is None:
             continue
@@ -501,5 +552,9 @@ def fetch_online_candidates(
                 outcome = f"{outcome}, trafienie ISBN"
             emit_provider_progress(provider, outcome)
         if any(candidate.reason == "isbn-exact" and candidate.score >= 420 for candidate in candidates):
+            break
+        if normalized_mode == "PL+" and provider == "lubimyczytac" and any(is_strong_candidate(candidate) for candidate in candidates):
+            break
+        if normalized_mode == "EN" and provider != "lubimyczytac" and any(is_strong_candidate(candidate) for candidate in candidates):
             break
     return all_candidates

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import csv
+from functools import cmp_to_key
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -15,7 +18,7 @@ MakeRecordClone: TypeAlias = Callable[..., RecordLike]
 FormatVolume: TypeAlias = Callable[[tuple[int, str] | None], str]
 ReadBookMetadata: TypeAlias = Callable[[Path], Any]
 InferRecord: TypeAlias = Callable[..., RecordLike]
-BuildMoves: TypeAlias = Callable[[list[RecordLike], Path, Path, str], list[Any]]
+BuildMoves: TypeAlias = Callable[[list[RecordLike], Path, Path, Path | None, str], list[Any]]
 ExecuteMoves: TypeAlias = Callable[[list[Any]], list[str]]
 WriteReportFn: TypeAlias = Callable[..., None]
 FlushOnlineCache: TypeAlias = Callable[..., None]
@@ -23,12 +26,89 @@ EmitProgress: TypeAlias = Callable[[str], None]
 ProcessedManifest: TypeAlias = dict[str, dict[str, Any]]
 
 PROCESSED_MANIFEST_NAME = "ebookren_processed.json"
-SUCCESSFUL_PROCESSING_STATUSES = {"copied", "renamed", "unchanged"}
+SUCCESSFUL_PROCESSING_STATUSES = {"copied", "copied+archived", "moved", "renamed", "unchanged"}
+
+if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "shlwapi"):
+    _STRCMP_LOGICALW = ctypes.windll.shlwapi.StrCmpLogicalW
+else:
+    _STRCMP_LOGICALW = None
+
+
+def compare_paths_windows_style(left: Path, right: Path) -> int:
+    if _STRCMP_LOGICALW is not None:
+        return int(_STRCMP_LOGICALW(str(left.name), str(right.name)))
+    def natural_key(path: Path) -> list[object]:
+        parts = re.split(r"(\d+)", str(path.name).lower())
+        key: list[object] = []
+        for part in parts:
+            if not part:
+                continue
+            key.append(int(part) if part.isdigit() else part)
+        return key
+
+    left_key = natural_key(left)
+    right_key = natural_key(right)
+    if left_key < right_key:
+        return -1
+    if left_key > right_key:
+        return 1
+    return 0
+
+
+def sort_paths_windows_style(paths: list[Path]) -> list[Path]:
+    return sorted(paths, key=cmp_to_key(compare_paths_windows_style))
 
 
 def set_output_folder(records: list[RecordLike], folder: Path) -> list[RecordLike]:
     for record in records:
         record.output_folder = folder
+    return records
+
+
+def actual_output_folder(record: RecordLike, default_folder: Path) -> Path:
+    folder = getattr(record, "output_folder", None)
+    return folder if isinstance(folder, Path) else default_folder
+
+
+def target_path_for_record(record: RecordLike, default_folder: Path) -> Path:
+    return actual_output_folder(record, default_folder) / record.filename
+
+
+def _path_key(path: Path) -> str:
+    return str(path.absolute()).lower()
+
+
+def next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    suffix = path.suffix
+    stem = path.stem
+    counter = 1
+    while True:
+        candidate = path.with_name(f"{stem} ({counter}){suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def assign_archive_source_paths(records: list[RecordLike], archive_folder: Path | None) -> list[RecordLike]:
+    if archive_folder is None:
+        for record in records:
+            setattr(record, "archive_source_path", None)
+        return records
+
+    reserved: set[str] = set()
+    if archive_folder.exists():
+        reserved = {_path_key(existing) for existing in archive_folder.iterdir()}
+
+    for record in records:
+        candidate = archive_folder / record.path.name
+        counter = 0
+        while _path_key(candidate) in reserved:
+            counter += 1
+            candidate = archive_folder / f"{record.path.stem} ({counter}){record.path.suffix}"
+        setattr(record, "archive_source_path", candidate)
+        reserved.add(_path_key(candidate))
     return records
 
 
@@ -40,32 +120,51 @@ def dedupe_destinations(
     make_record_clone: MakeRecordClone,
 ) -> list[RecordLike]:
     source_paths = {record.path.resolve() for record in records}
-    reserved_names: set[str] = set()
-    existing_items = folder.iterdir() if folder.exists() else []
-    for existing in existing_items:
-        if not is_supported_book_file(existing):
-            continue
-        if existing.resolve() not in source_paths:
-            reserved_names.add(existing.name.lower())
+    duplicate_folder = folder / "dubel"
+    reserved_destinations: set[tuple[Path, str]] = set()
+    for candidate_folder in (folder, duplicate_folder):
+        existing_items = candidate_folder.iterdir() if candidate_folder.exists() else []
+        for existing in existing_items:
+            if not is_supported_book_file(existing):
+                continue
+            if existing.resolve() not in source_paths:
+                reserved_destinations.add((candidate_folder.resolve(), existing.name.lower()))
 
-    used_names = set(reserved_names)
+    used_destinations = set(reserved_destinations)
     final: list[RecordLike] = []
 
     for record in records:
         final_record = record
-        suffix_no = 0
-        while final_record.filename.lower() in used_names:
-            suffix_no += 1
+        destination_folder = actual_output_folder(final_record, folder)
+        destination_key = (destination_folder.resolve(), final_record.filename.lower())
+        if destination_key in reserved_destinations and destination_folder.resolve() == folder.resolve():
             final_record = make_record_clone(
                 record,
-                notes=record.notes + ["dedupe-suffix", "existing-file-conflict"],
-                confidence=max(0, record.confidence - 5),
+                notes=record.notes + ["dedupe-dubel", "existing-file-conflict"],
+                confidence=max(0, record.confidence - 3),
                 review_reasons=record.review_reasons + ["kolizja-nazwy"],
-                decision_reasons=record.decision_reasons + [f"dedupe:filename-suffix-{suffix_no}"],
-                filename_suffix=f"({suffix_no})",
+                decision_reasons=record.decision_reasons + ["dedupe:dubel-folder"],
+                output_folder=duplicate_folder,
             )
+            destination_folder = actual_output_folder(final_record, folder)
+            destination_key = (destination_folder.resolve(), final_record.filename.lower())
 
-        used_names.add(final_record.filename.lower())
+        suffix_no = 0
+        while destination_key in used_destinations:
+            suffix_no += 1
+            final_record = make_record_clone(
+                final_record,
+                notes=final_record.notes + ["dedupe-suffix", "existing-file-conflict"],
+                confidence=max(0, final_record.confidence - 5),
+                review_reasons=final_record.review_reasons + ["kolizja-nazwy"],
+                decision_reasons=final_record.decision_reasons + [f"dedupe:filename-suffix-{suffix_no}"],
+                filename_suffix=f"({suffix_no})",
+                output_folder=actual_output_folder(final_record, folder),
+            )
+            destination_folder = actual_output_folder(final_record, folder)
+            destination_key = (destination_folder.resolve(), final_record.filename.lower())
+
+        used_destinations.add(destination_key)
         final.append(final_record)
 
     return final
@@ -109,18 +208,22 @@ def write_report(
                 "change_status",
                 "execution_status",
                 "operation",
+                "archive_source_name",
+                "archive_source_folder",
                 "mode",
             ]
         )
         for row in rows:
+            target_folder_for_row = actual_output_folder(row, target_folder)
             target_name = row.filename
+            archive_path = getattr(row, "archive_source_path", None)
             status = ""
             if execution_status is not None:
                 status = execution_status.get(row.path.resolve(), "")
             if not status:
                 if row.needs_review:
                     status = "review-required"
-                elif source_folder.resolve() == target_folder.resolve() and row.path.name == target_name:
+                elif source_folder.resolve() == target_folder_for_row.resolve() and row.path.name == target_name:
                     status = "unchanged"
                 else:
                     status = "planned"
@@ -129,7 +232,7 @@ def write_report(
                     row.path.name,
                     target_name,
                     str(source_folder),
-                    str(target_folder),
+                    str(target_folder_for_row),
                     row.path.name,
                     target_name,
                     row.author,
@@ -146,9 +249,11 @@ def write_report(
                     " | ".join(row.decision_reasons),
                     "yes" if row.online_checked else "no",
                     "yes" if row.online_applied else "no",
-                    operation if row.path.name != target_name or source_folder.resolve() != target_folder.resolve() else "unchanged",
+                    operation if row.path.name != target_name or source_folder.resolve() != target_folder_for_row.resolve() else "unchanged",
                     status,
                     operation,
+                    archive_path.name if isinstance(archive_path, Path) else "",
+                    str(archive_path.parent) if isinstance(archive_path, Path) else "",
                     "dry-run" if dry_run else "apply",
                 ]
             )
@@ -266,11 +371,20 @@ def build_progress_lines(record: RecordLike, *, index: int, total: int, target_f
             deduped_steps.append(step)
 
     review_suffix = " [CHECK]" if getattr(record, "needs_review", False) else ""
-    return [
+    destination = target_path_for_record(record, target_folder)
+    try:
+        destination_label = str(destination.relative_to(target_folder))
+    except ValueError:
+        destination_label = destination.name
+    lines = [
         f"[{index}/{total}] {record.path.name}{review_suffix}",
         f"  sciezka: {' -> '.join(deduped_steps) if deduped_steps else 'nieznana'}",
-        f"  wynik: {record.path.name} -> {(target_folder / record.filename).name}",
+        f"  wynik: {record.path.name} -> {destination_label}",
     ]
+    archive_path = getattr(record, "archive_source_path", None)
+    if isinstance(archive_path, Path):
+        lines.append(f"  oryginal: {record.path.name} -> {archive_path.name}")
+    return lines
 
 
 def build_skip_progress_lines(path: Path, *, index: int, total: int) -> list[str]:
@@ -363,22 +477,24 @@ def call_infer_record(
     use_online: bool,
     providers: list[str],
     timeout: float,
+    online_mode: str,
     emit_stage: Callable[[str, str], None] | None = None,
     emit_trace: Callable[[str], None] | None = None,
 ) -> RecordLike:
     if emit_stage is None and emit_trace is None:
-        return infer_record(meta, use_online=use_online, providers=providers, timeout=timeout)
+        return infer_record(meta, use_online=use_online, providers=providers, timeout=timeout, online_mode=online_mode)
     try:
         return infer_record(
             meta,
             use_online=use_online,
             providers=providers,
             timeout=timeout,
+            online_mode=online_mode,
             emit_stage=emit_stage,
             emit_trace=emit_trace,
         )
     except TypeError as exc:
-        if "emit_stage" not in str(exc) and "emit_trace" not in str(exc):
+        if "emit_stage" not in str(exc) and "emit_trace" not in str(exc) and "online_mode" not in str(exc):
             raise
         return infer_record(meta, use_online=use_online, providers=providers, timeout=timeout)
 
@@ -387,6 +503,8 @@ def run_job(
     folder: Path,
     *,
     destination_folder: Path | None,
+    archive_folder: Path | None,
+    online_mode: str,
     apply_changes: bool,
     use_online: bool,
     providers: list[str],
@@ -413,11 +531,25 @@ def run_job(
     if not folder.exists():
         return 2, [f"Folder nie istnieje: {folder}"]
     target_folder = destination_folder if destination_folder is not None else folder
-    operation = "rename" if target_folder.resolve() == folder.resolve() else "copy"
-    if apply_changes and operation == "copy":
+    if archive_folder is not None:
+        if target_folder.resolve() == folder.resolve():
+            return 2, ["Folder archiwum oryginalow wymaga osobnego folderu docelowego ze zmieniona nazwa."]
+        if archive_folder.resolve() == folder.resolve():
+            return 2, ["Folder archiwum oryginalow nie moze byc taki sam jak folder zrodlowy."]
+        if archive_folder.resolve() == target_folder.resolve():
+            return 2, ["Folder archiwum oryginalow nie moze byc taki sam jak folder docelowy zmian nazw."]
+    if target_folder.resolve() == folder.resolve():
+        operation = "rename"
+    elif archive_folder is not None:
+        operation = "copy+archive"
+    else:
+        operation = "copy"
+    if apply_changes and operation in {"copy", "copy+archive"}:
         target_folder.mkdir(parents=True, exist_ok=True)
+    if apply_changes and archive_folder is not None:
+        archive_folder.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(path for path in folder.iterdir() if is_supported_book_file(path))
+    files = sort_paths_windows_style([path for path in folder.iterdir() if is_supported_book_file(path)])
     if not files:
         return 0, ["Brak obslugiwanych plikow ebook."]
 
@@ -489,6 +621,7 @@ def run_job(
                 use_online=use_online,
                 providers=providers,
                 timeout=timeout,
+                online_mode=online_mode,
                 emit_stage=make_stage_emitter(emit_progress, path=path, index=index, total=len(files)),
                 emit_trace=emit_trace,
             )
@@ -497,6 +630,7 @@ def run_job(
 
             record.output_folder = target_folder
             record = dedupe_destinations_fn([record], target_folder)[0]
+            assign_archive_source_paths([record], archive_folder)
             records.append(record)
             if emit_progress is not None:
                 emit_progress("\n".join(build_progress_lines(record, index=len(records), total=len(files), target_folder=target_folder)))
@@ -505,7 +639,7 @@ def run_job(
                 execution_status[record.path.resolve()] = "unchanged"
                 continue
 
-            moves = build_moves([record], folder, target_folder, stamp)
+            moves = build_moves([record], folder, target_folder, archive_folder, stamp)
             if not moves:
                 execution_status[record.path.resolve()] = "unchanged"
                 continue
@@ -518,7 +652,12 @@ def run_job(
                 execution_status[record.path.resolve()] = "failed"
                 errors.extend(move_errors)
             else:
-                execution_status[record.path.resolve()] = "renamed" if operation == "rename" else "copied"
+                if operation == "rename":
+                    execution_status[record.path.resolve()] = "renamed"
+                elif operation == "copy+archive":
+                    execution_status[record.path.resolve()] = "copied+archived"
+                else:
+                    execution_status[record.path.resolve()] = "copied"
                 written_total += len(moves)
             update_processed_manifest_entry(
                 processed_manifest,
@@ -559,6 +698,7 @@ def run_job(
                 f"OPERATION={operation.upper()}",
                 f"SOURCE={folder}",
                 f"DESTINATION={target_folder}",
+                f"ARCHIVE={archive_folder or ''}",
                 f"MANIFEST={processed_manifest_path(folder)}",
                 f"SKIPPED={len(skipped_files)}",
                 f"INFER_WORKERS={infer_workers}",
@@ -607,11 +747,13 @@ def run_job(
                 use_online=use_online,
                 providers=providers,
                 timeout=timeout,
+                online_mode=online_mode,
                 emit_stage=make_stage_emitter(emit_progress, path=meta.path, index=index, total=len(metas)),
                 emit_trace=emit_trace,
             )
             record.output_folder = target_folder
             record = dedupe_destinations_fn([record], target_folder)[0]
+            assign_archive_source_paths([record], archive_folder)
             records.append(record)
             emit_progress(
                 "\n".join(
@@ -645,6 +787,7 @@ def run_job(
                 record = future.result()
                 record.output_folder = target_folder
                 record = dedupe_destinations_fn([record], target_folder)[0]
+                assign_archive_source_paths([record], archive_folder)
                 records_by_index[index] = record
                 completed_records += 1
                 if emit_progress is not None:
@@ -663,6 +806,7 @@ def run_job(
 
     records = set_output_folder_fn(records, target_folder)
     records = dedupe_destinations_fn(records, target_folder)
+    records = assign_archive_source_paths(records, archive_folder)
     execution_status: dict[Path, str] = {}
     for record in records:
         if operation == "rename" and record.path.name == record.filename:
@@ -680,7 +824,7 @@ def run_job(
             operation=operation,
             execution_status=execution_status,
         )
-        to_write = len(build_moves(records, folder, target_folder, stamp))
+        to_write = len(build_moves(records, folder, target_folder, archive_folder, stamp))
         review_count = sum(1 for record in records if record.needs_review)
         lines.append(f"TOTAL={len(records)} | SKIPPED={len(skipped_files)} | REVIEW={review_count} | TO_WRITE={to_write}")
         lines.extend(
@@ -689,6 +833,7 @@ def run_job(
                 f"OPERATION={operation.upper()}",
                 f"SOURCE={folder}",
                 f"DESTINATION={target_folder}",
+                f"ARCHIVE={archive_folder or ''}",
                 f"MANIFEST={processed_manifest_path(folder)}",
                 f"SKIPPED={len(skipped_files)}",
                 f"INFER_WORKERS={infer_workers}",
@@ -702,11 +847,11 @@ def run_job(
         )
         for record in records[:10]:
             flag = " [CHECK]" if record.needs_review else ""
-            lines.append(f"{record.path.name} -> {target_folder / record.filename} (confidence={record.confidence}){flag}")
+            lines.append(f"{record.path.name} -> {target_path_for_record(record, target_folder)} (confidence={record.confidence}){flag}")
         flush_online_cache_if_needed(force=True)
         return 0, lines
 
-    moves = build_moves(records, folder, target_folder, stamp)
+    moves = build_moves(records, folder, target_folder, archive_folder, stamp)
     execute_started_at = time.perf_counter()
     errors = execute_moves(moves)
     execute_ms = int((time.perf_counter() - execute_started_at) * 1000)
@@ -715,7 +860,15 @@ def run_job(
             execution_status[move.source.resolve()] = "failed"
     else:
         for move in moves:
-            execution_status[move.source.resolve()] = "renamed" if move.operation == "rename" else "copied"
+            if move.operation == "rename":
+                execution_status[move.source.resolve()] = "renamed"
+            elif move.operation == "move":
+                if operation == "copy+archive":
+                    execution_status[move.source.resolve()] = "copied+archived"
+                else:
+                    execution_status[move.source.resolve()] = "moved"
+            elif move.operation == "copy":
+                execution_status[move.source.resolve()] = "copied"
     write_report_fn(
         report_path,
         records,
@@ -751,6 +904,7 @@ def run_job(
             f"OPERATION={operation.upper()}",
             f"SOURCE={folder}",
             f"DESTINATION={target_folder}",
+            f"ARCHIVE={archive_folder or ''}",
             f"MANIFEST={processed_manifest_path(folder)}",
             f"SKIPPED={len(skipped_files)}",
             f"INFER_WORKERS={infer_workers}",

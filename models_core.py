@@ -105,3 +105,26 @@ class OnlineRoleEvidence:
     titles: dict[str, str]
     series: dict[str, str]
     volumes: set[tuple[int, str]]
+
+
+@dataclass(frozen=True)
+class HybridLocalParse:
+    title_hint: str = ""
+    author_hint: str = ""
+    volume_hint: tuple[int, str] | None = None
+    source: str = ""
+    confidence: int = 0
+
+
+@dataclass(frozen=True)
+class LocalPrototype:
+    path: Path
+    author: str
+    series: str
+    volume: tuple[int, str] | None
+    title: str
+    genre: str
+    source: str
+    confidence: int
+    title_from_core: bool = False
+    author_from_trailing_core: bool = False

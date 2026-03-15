@@ -7,12 +7,15 @@ import atexit
 from pathlib import Path
 from typing import Callable, Iterable
 
+import author_catalog as author_catalog_mod
 import cache_online as cache_online_mod
+import candidate_scorer as candidate_scorer_mod
 import domain_naming as domain_naming_mod
 import infer_engine as infer_engine_mod
 import infer_flow as infer_flow_mod
 import infer_core as infer_core_mod
 import job_runner as job_runner_mod
+import local_parser as local_parser_mod
 import providers_online as providers_online_mod
 import runtime_metadata as runtime_metadata_mod
 import runtime_online as runtime_online_mod
@@ -28,6 +31,8 @@ from fs_ops import (
 from models_core import (
     Candidate,
     EpubMetadata,
+    HybridLocalParse,
+    LocalPrototype,
     LubimyczytacResult,
     OnlineCandidate,
     OnlineRoleEvidence,
@@ -49,6 +54,7 @@ from runtime_config import (
     CORE_TITLE_AUTHOR_RE,
     DEFAULT_HTTP_TIMEOUT,
     DEFAULT_INFER_WORKERS,
+    DEFAULT_ONLINE_MODE,
     DEFAULT_PROVIDERS,
     DEFAULT_SOURCE_FOLDER,
     DEVICE_NAMES,
@@ -91,8 +97,10 @@ from runtime_config import (
 __all__ = [
     "APP_NAME",
     "APP_VERSION",
+    "LocalPrototype",
     "DEFAULT_HTTP_TIMEOUT",
     "DEFAULT_INFER_WORKERS",
+    "DEFAULT_ONLINE_MODE",
     "DEFAULT_PROVIDERS",
     "DEFAULT_SOURCE_FOLDER",
     "GUI_FOOTER_TEXT",
@@ -111,6 +119,8 @@ ONLINE_CACHE_PATH = Path(__file__).with_name("online_cache.json")
 ONLINE_CACHE_DIRTY = False
 ONLINE_CACHE_PENDING_WRITES = 0
 ONLINE_CACHE_LAST_SAVE = 0.0
+AUTHOR_PATTERNS_PATH = Path(__file__).with_name("author_patterns.csv")
+_AUTHOR_CATALOG: author_catalog_mod.AuthorCatalog | None = None
 ONLINE_CACHE_SAVE_EVERY = 10
 ONLINE_CACHE_SAVE_INTERVAL = 5.0
 LUBIMYCZYTAC_RATE_LOCK = threading.Lock()
@@ -456,6 +466,75 @@ def normalize_match_text(text: str | None) -> str:
     return infer_core_mod.normalize_match_text(text)
 
 
+def _author_catalog() -> author_catalog_mod.AuthorCatalog:
+    global _AUTHOR_CATALOG
+    if _AUTHOR_CATALOG is None:
+        _AUTHOR_CATALOG = author_catalog_mod.load_author_catalog(AUTHOR_PATTERNS_PATH)
+    return _AUTHOR_CATALOG
+
+
+def resolve_known_author(text: str | None) -> str:
+    return _author_catalog().resolve(clean_author_segment(text))
+
+
+def is_known_author(text: str | None) -> bool:
+    return _author_catalog().is_known(clean_author_segment(text))
+
+
+def split_known_author_prefix(text: str | None) -> tuple[str, str] | None:
+    return _author_catalog().split_prefix(clean(text))
+
+
+def split_known_author_suffix(text: str | None) -> tuple[str, str] | None:
+    return _author_catalog().split_suffix(clean(text))
+
+
+def resolve_author_segment(text: str | None) -> list[str]:
+    return _author_catalog().resolve_authors(clean_author_segment(text))
+
+
+def parse_hybrid_local(meta: EpubMetadata) -> HybridLocalParse:
+    return local_parser_mod.parse_hybrid_local(
+        meta,
+        clean=clean,
+        clean_author_segment=clean_author_segment,
+        looks_like_author_segment=looks_like_author_segment,
+        strip_leading_title_index=strip_leading_title_index,
+        parse_volume_parts=parse_volume_parts,
+        resolve_known_author=resolve_known_author,
+        is_known_author=is_known_author,
+        split_known_author_prefix=split_known_author_prefix,
+        split_known_author_suffix=split_known_author_suffix,
+        resolve_author_segment=resolve_author_segment,
+    )
+
+
+def choose_best_local_series_candidate(meta: EpubMetadata, candidates: list[Candidate]) -> Candidate | None:
+    return candidate_scorer_mod.choose_best_local_series_candidate(
+        meta,
+        candidates,
+        clean=clean,
+        normalize_match_text=normalize_match_text,
+        similarity_score=similarity_score,
+        strip_leading_title_index=strip_leading_title_index,
+        looks_like_author_segment=looks_like_author_segment,
+        series_source_priorities=SERIES_SOURCE_PRIORITIES,
+    )
+
+
+def choose_best_local_title_candidate(meta: EpubMetadata, candidates: list[Candidate], selected_series: str) -> Candidate | None:
+    return candidate_scorer_mod.choose_best_local_title_candidate(
+        meta,
+        candidates,
+        selected_series,
+        clean=clean,
+        normalize_match_text=normalize_match_text,
+        similarity_score=similarity_score,
+        strip_leading_title_index=strip_leading_title_index,
+        looks_like_author_segment=looks_like_author_segment,
+    )
+
+
 def infer_book_genre(labels: Iterable[str]) -> str:
     return infer_core_mod.infer_book_genre(labels)
 
@@ -568,6 +647,7 @@ def fetch_online_candidates(
     providers: list[str],
     timeout: float,
     *,
+    online_mode: str = DEFAULT_ONLINE_MODE,
     emit_stage: Callable[[str, str], None] | None = None,
     query_label: str = "",
 ) -> list[OnlineCandidate]:
@@ -602,6 +682,7 @@ def fetch_online_candidates(
             meta,
             providers,
             timeout,
+            online_mode=online_mode,
             emit_provider_progress=(
                 (
                     lambda provider, outcome: emit_stage(
@@ -619,7 +700,7 @@ def fetch_online_candidates(
         )
 
 
-def build_online_query_variants(meta: EpubMetadata, record: BookRecord) -> list[EpubMetadata]:
+def build_online_query_variants(meta: EpubMetadata, record: BookRecord | LocalPrototype) -> list[EpubMetadata]:
     return infer_engine_mod.build_online_query_variants(
         meta,
         record,
@@ -744,6 +825,10 @@ def validate_record_components_with_online(
         strip_leading_title_index=strip_leading_title_index,
         sanitize_title=sanitize_title,
         clean=clean,
+        clean_author_segment=clean_author_segment,
+        split_authors=split_authors,
+        similarity_score=similarity_score,
+        normalize_match_text=normalize_match_text,
         verification_type=OnlineVerification,
         extract_trailing_author_from_core=extract_trailing_author_from_core,
     )
@@ -864,6 +949,15 @@ def split_trailing_series_book(title: str) -> tuple[str, str, tuple[int, str] | 
     )
 
 
+def split_square_bracket_series_book(title: str) -> tuple[str, str, tuple[int, str] | None] | None:
+    return infer_engine_mod.split_square_bracket_series_book(
+        title,
+        clean=clean,
+        clean_series=clean_series,
+        parse_volume_parts=parse_volume_parts,
+    )
+
+
 def collect_title_candidates(title: str, candidates: list[Candidate]) -> None:
     infer_engine_mod.collect_title_candidates(
         title,
@@ -872,6 +966,7 @@ def collect_title_candidates(title: str, candidates: list[Candidate]) -> None:
         parse_volume_parts=parse_volume_parts,
         add_candidate=add_candidate,
         split_trailing_series_book=split_trailing_series_book,
+        split_square_bracket_series_book=split_square_bracket_series_book,
         title_dotted_series_book_re=TITLE_DOTTED_SERIES_BOOK_RE,
         title_double_colon_book_re=TITLE_DOUBLE_COLON_BOOK_RE,
         title_with_series_re=TITLE_WITH_SERIES_RE,
@@ -959,8 +1054,6 @@ def strip_author_from_title(title: str, author: str) -> str:
 
 
 def read_book_metadata(path: Path) -> EpubMetadata:
-    from ebooklib import epub as epub_module
-
     return runtime_metadata_mod.read_book_metadata(
         path,
         metadata_type=EpubMetadata,
@@ -968,7 +1061,7 @@ def read_book_metadata(path: Path) -> EpubMetadata:
         clean=clean,
         clean_series=clean_series,
         parse_volume_parts=parse_volume_parts,
-        epub_module=epub_module,
+        epub_module=None,
     )
 
 
@@ -977,8 +1070,10 @@ def extract_authors(creators: list[str], segment_author: str) -> str:
     return infer_engine_mod.extract_authors(
         creators,
         segment_author,
+        resolve_author_segment=resolve_author_segment,
         split_authors=split_authors,
         canonicalize_authors=canonicalize_authors,
+        to_last_first=to_last_first,
     )
 
 
@@ -1084,6 +1179,7 @@ def infer_record(
     providers: list[str],
     timeout: float,
     *,
+    online_mode: str = DEFAULT_ONLINE_MODE,
     emit_stage: Callable[[str, str], None] | None = None,
     emit_trace: Callable[[str], None] | None = None,
 ) -> BookRecord:
@@ -1092,6 +1188,7 @@ def infer_record(
         use_online,
         providers,
         timeout,
+        online_mode=online_mode,
         parse_existing_filename=parse_existing_filename,
         book_record_type=BookRecord,
         extract_isbns=extract_isbns,
@@ -1103,9 +1200,12 @@ def infer_record(
         looks_like_author_segment=looks_like_author_segment,
         extract_trailing_author_from_core=extract_trailing_author_from_core,
         extract_authors=extract_authors,
+        parse_hybrid_local=parse_hybrid_local,
         collect_title_candidates=collect_title_candidates,
         collect_core_candidates=collect_core_candidates,
         collect_segment_candidates=collect_segment_candidates,
+        choose_best_local_series_candidate=choose_best_local_series_candidate,
+        choose_best_local_title_candidate=choose_best_local_title_candidate,
         choose_series_candidate=choose_series_candidate,
         choose_title_candidate=choose_title_candidate,
         sanitize_title=sanitize_title,
@@ -1120,6 +1220,8 @@ def infer_record(
         pick_best_online_match=pick_best_online_match,
         build_online_record=build_online_record,
         split_authors=split_authors,
+        normalize_match_text=normalize_match_text,
+        resolve_author_segment=resolve_author_segment,
         online_candidate_supports_record_context_fn=online_candidate_supports_record_context,
         collect_online_candidate_candidates=collect_online_candidate_candidates,
         source_needs_online_verification=source_needs_online_verification,
@@ -1142,6 +1244,7 @@ def make_record_clone(
     review_reasons: list[str] | None = None,
     decision_reasons: list[str] | None = None,
     filename_suffix: str | None = None,
+    output_folder: Path | None = None,
 ) -> BookRecord:
     return domain_naming_mod.make_record_clone(
         record,
@@ -1151,6 +1254,7 @@ def make_record_clone(
         review_reasons=review_reasons,
         decision_reasons=decision_reasons,
         filename_suffix=filename_suffix,
+        output_folder=output_folder,
     )
 
 
@@ -1169,8 +1273,14 @@ def dedupe_destinations(records: list[BookRecord], folder: Path) -> list[BookRec
 
 
 
-def build_moves(records: list[BookRecord], source_folder: Path, target_folder: Path, stamp: str) -> list[RenameMove]:
-    return fs_build_moves(records, source_folder, target_folder, stamp)
+def build_moves(
+    records: list[BookRecord],
+    source_folder: Path,
+    target_folder: Path,
+    archive_folder: Path | None,
+    stamp: str,
+) -> list[RenameMove]:
+    return fs_build_moves(records, source_folder, target_folder, archive_folder, stamp)
 
 
 
@@ -1229,6 +1339,8 @@ def run_job(
     folder: Path,
     *,
     destination_folder: Path | None = None,
+    archive_folder: Path | None = None,
+    online_mode: str = DEFAULT_ONLINE_MODE,
     apply_changes: bool,
     use_online: bool,
     providers: list[str],
@@ -1242,6 +1354,8 @@ def run_job(
     return job_runner_mod.run_job(
         folder,
         destination_folder=destination_folder,
+        archive_folder=archive_folder,
+        online_mode=online_mode,
         apply_changes=apply_changes,
         use_online=use_online,
         providers=providers,

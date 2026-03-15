@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Callable, Iterable, TypeAlias
+from typing import Any, Callable, Iterable, TypeAlias
 
 from domain_naming import BookRecord
 from models_core import Candidate, EpubMetadata
@@ -9,6 +9,10 @@ from models_core import Candidate, EpubMetadata
 StrCleaner: TypeAlias = Callable[[str | None], str]
 VolumeParser: TypeAlias = Callable[[str | None], tuple[int, str] | None]
 LooksLikeText: TypeAlias = Callable[[str | None], bool]
+GENERIC_VOLUME_MARKER_RE = re.compile(
+    r"(?:^|[\s,._-])(?:book|tom|volume|vol\.?|part|cykl|czesc|część|ksiega|księga)\s*$",
+    re.IGNORECASE,
+)
 
 
 def add_candidate(
@@ -193,8 +197,7 @@ def normalize_lubimyczytac_query_title(title: str, *, sanitize_title_for_online_
     value = value.replace("?", "").replace("_", " ")
     if '"' in value or ",," in value:
         value = value.split('"')[0].split(",,")[0]
-    if "&" in value:
-        value = value.split("&")[0]
+    value = value.replace("&", " ")
     value = value.replace("#", "")
     value = value.replace("(", " ").replace(")", " ")
     if "'" in value:
@@ -291,6 +294,60 @@ def split_trailing_series_book(
     return best[1], best[2], volume
 
 
+def looks_like_generic_volume_prefix(text: str, *, clean: StrCleaner) -> bool:
+    value = clean(text)
+    if not value:
+        return False
+    return bool(GENERIC_VOLUME_MARKER_RE.search(value))
+
+
+def split_square_bracket_series_book(
+    title: str,
+    *,
+    clean: StrCleaner,
+    clean_series: StrCleaner,
+    parse_volume_parts: VolumeParser,
+) -> tuple[str, str, tuple[int, str] | None] | None:
+    normalized = clean(title)
+    if not normalized:
+        return None
+
+    def parse_bracket_payload(payload: str) -> tuple[str, tuple[int, str] | None] | None:
+        inner = clean(payload)
+        if not inner:
+            return None
+        inner = re.sub(r"^(?:cykl|seria)\s*[-:\s]+", "", inner, flags=re.IGNORECASE)
+        paren_match = re.match(r"^(.*?)\s*\(([^()]+)\)\s*$", inner)
+        if paren_match:
+            series_name = clean_series(paren_match.group(1))
+            volume = parse_volume_parts(paren_match.group(2))
+            if series_name and volume is not None:
+                return series_name, volume
+        tail_match = re.match(r"^(.*?)\s+([0-9]+(?:\.[0-9]+)?|[IVXLCDM]+)\s*$", inner, flags=re.IGNORECASE)
+        if tail_match:
+            series_name = clean_series(tail_match.group(1))
+            volume = parse_volume_parts(tail_match.group(2))
+            if series_name and volume is not None:
+                return series_name, volume
+        return None
+
+    prefix_match = re.match(r"^\[([^\]]+)\]\s*(.+)$", normalized)
+    if prefix_match:
+        parsed = parse_bracket_payload(prefix_match.group(1))
+        title_part = clean(prefix_match.group(2))
+        if parsed is not None and title_part:
+            return title_part, parsed[0], parsed[1]
+
+    suffix_match = re.match(r"^(.*?)\s*\[([^\]]+)\]\s*$", normalized)
+    if suffix_match:
+        parsed = parse_bracket_payload(suffix_match.group(2))
+        title_part = clean(suffix_match.group(1))
+        if parsed is not None and title_part:
+            return title_part, parsed[0], parsed[1]
+
+    return None
+
+
 def collect_title_candidates(
     title: str,
     candidates: list[Candidate],
@@ -299,6 +356,7 @@ def collect_title_candidates(
     parse_volume_parts,
     add_candidate,
     split_trailing_series_book,
+    split_square_bracket_series_book,
     title_dotted_series_book_re,
     title_double_colon_book_re,
     title_with_series_re,
@@ -316,11 +374,20 @@ def collect_title_candidates(
 
     match = title_dotted_series_book_re.match(title)
     if match:
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 97, "title:dotted-series-book", match.group(3))
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 97, "title:dotted-series-book", match.group(3))
 
     match = title_double_colon_book_re.match(title)
     if match:
-        add_candidate(candidates, match.group(2), parse_volume_parts(match.group(3)), 98, "title:double-colon-book", match.group(1))
+        volume = parse_volume_parts(match.group(3))
+        if volume is not None:
+            add_candidate(candidates, match.group(2), volume, 98, "title:double-colon-book", match.group(1))
+
+    square_bracket_series_book = split_square_bracket_series_book(title)
+    if square_bracket_series_book is not None:
+        title_part, series_part, volume = square_bracket_series_book
+        add_candidate(candidates, series_part, volume, 96, "title:square-bracket-series-book", title_part)
 
     trailing_series_book = split_trailing_series_book(title)
     if trailing_series_book is not None:
@@ -329,19 +396,27 @@ def collect_title_candidates(
 
     match = title_with_series_re.match(title)
     if match:
-        add_candidate(candidates, match.group(2), parse_volume_parts(match.group(3)), 93, "title:series-book", match.group(1))
+        volume = parse_volume_parts(match.group(3))
+        if volume is not None:
+            add_candidate(candidates, match.group(2), volume, 93, "title:series-book", match.group(1))
 
     match = paren_series_re.match(title)
     if match:
-        add_candidate(candidates, match.group(2), parse_volume_parts(match.group(3)), 92, "title:paren-series", match.group(1))
+        volume = parse_volume_parts(match.group(3))
+        if volume is not None:
+            add_candidate(candidates, match.group(2), volume, 92, "title:paren-series", match.group(1))
 
     match = series_only_paren_index_re.match(title)
     if match:
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 91, "title:series-index-only")
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 91, "title:series-index-only")
 
     match = title_colon_series_index_re.match(title)
     if match:
-        add_candidate(candidates, match.group(2), parse_volume_parts(match.group(3)), 94, "title:colon-series-index", match.group(1))
+        volume = parse_volume_parts(match.group(3))
+        if volume is not None:
+            add_candidate(candidates, match.group(2), volume, 94, "title:colon-series-index", match.group(1))
 
     match = leading_index_dotted_title_re.match(title)
     if match:
@@ -354,11 +429,15 @@ def collect_title_candidates(
 
     match = indexed_title_re.match(title)
     if match and not re.match(r"^\d", clean(match.group(3))):
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 86, "title:indexed", match.group(3))
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 86, "title:indexed", match.group(3))
 
     match = index_only_re.match(title)
     if match:
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 78, "title:index-only")
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 78, "title:index-only")
 
     match = box_set_re.match(title)
     if match:
@@ -391,27 +470,52 @@ def collect_core_candidates(
 
     match = paren_series_re.match(core)
     if match:
-        add_candidate(candidates, match.group(2), parse_volume_parts(match.group(3)), 90, "core:paren-series", match.group(1))
+        volume = parse_volume_parts(match.group(3))
+        if volume is not None:
+            add_candidate(candidates, match.group(2), volume, 90, "core:paren-series", match.group(1))
 
     match = core_title_author_re.match(core)
-    if match and looks_like_author_segment(match.group(4)) and not re.match(r"^\d+\b", clean(match.group(3))):
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 91, "core:title-author", match.group(3))
+    if (
+        match
+        and looks_like_author_segment(match.group(4))
+        and not re.match(r"^\d+\b", clean(match.group(3)))
+        and not looks_like_generic_volume_prefix(match.group(1), clean=clean)
+    ):
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 91, "core:title-author", match.group(3))
 
     match = core_comma_re.match(core)
-    if match:
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 87, "core:comma", match.group(3))
+    if match and not looks_like_generic_volume_prefix(match.group(1), clean=clean):
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 87, "core:comma", match.group(3))
 
     match = core_joined_re.match(core)
-    if match and not re.match(r"^\d+\b", clean(match.group(3))):
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 88, "core:joined", match.group(3))
+    if (
+        match
+        and not re.match(r"^\d+\b", clean(match.group(3)))
+        and not looks_like_generic_volume_prefix(match.group(1), clean=clean)
+    ):
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 88, "core:joined", match.group(3))
 
     match = core_spaced_re.match(core)
-    if match and not re.match(r"^\d+\b", clean(match.group(3))):
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 80, "core:spaced", match.group(3))
+    if (
+        match
+        and not re.match(r"^\d+\b", clean(match.group(3)))
+        and not looks_like_generic_volume_prefix(match.group(1), clean=clean)
+    ):
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 80, "core:spaced", match.group(3))
 
     match = core_index_only_re.match(core)
     if match:
-        add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 76, "core:index-only")
+        volume = parse_volume_parts(match.group(2))
+        if volume is not None:
+            add_candidate(candidates, match.group(1), volume, 76, "core:index-only")
 
 
 def collect_segment_candidates(
@@ -434,15 +538,21 @@ def collect_segment_candidates(
 
         match = segment_hash_re.search(segment)
         if match:
-            add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 74, "segment:hash")
+            volume = parse_volume_parts(match.group(2))
+            if volume is not None:
+                add_candidate(candidates, match.group(1), volume, 74, "segment:hash")
 
         match = segment_comma_re.match(segment)
         if match:
-            add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 72, "segment:comma")
+            volume = parse_volume_parts(match.group(2))
+            if volume is not None:
+                add_candidate(candidates, match.group(1), volume, 72, "segment:comma")
 
         match = segment_year_re.match(segment)
         if match:
-            add_candidate(candidates, match.group(1), parse_volume_parts(match.group(2)), 75, "segment:year")
+            volume = parse_volume_parts(match.group(2))
+            if volume is not None:
+                add_candidate(candidates, match.group(1), volume, 75, "segment:year")
 
 
 def sanitize_title(
@@ -518,19 +628,64 @@ def strip_author_from_title(title: str, author: str, *, clean, looks_like_author
     return clean(title)
 
 
-def extract_authors(creators: list[str], segment_author: str, *, split_authors, canonicalize_authors) -> str:
+def extract_authors(creators: list[str], segment_author: str, *, resolve_author_segment, split_authors, canonicalize_authors, to_last_first) -> str:
     raw: list[str] = []
+    ordered: list[str] = []
+
+    def token_signature(text: str) -> tuple[str, ...]:
+        return tuple(re.sub(r"[\W\d_]+", "", token, flags=re.UNICODE).lower() for token in text.split() if token)
+
+    def extend_ordered(values: list[str]) -> None:
+        seen = {re.sub(r"[^a-z0-9]", "", to_last_first(item).lower()) for item in ordered}
+        for value in values:
+            normalized = to_last_first(value)
+            key = re.sub(r"[^a-z0-9]", "", normalized.lower())
+            if normalized and key and key not in seen:
+                seen.add(key)
+                ordered.append(normalized)
+
+    def pick_authors(text: str) -> tuple[list[str], bool]:
+        plain = split_authors(text)
+        resolved = resolve_author_segment(text)
+        if len(resolved) > 1 and (len(resolved) > len(plain) or len(plain) <= 1):
+            return resolved, True
+        if len(resolved) > 1 and any(len(part.split()) < 2 for part in plain):
+            return resolved, True
+        if len(resolved) == 1 and len(plain) > 1:
+            plain_resolved = [resolve_author_segment(part) for part in plain]
+            matching_parts = sum(1 for item in plain_resolved if item == resolved)
+            recognized_parts = sum(1 for item in plain_resolved if item)
+            if matching_parts == 1 and recognized_parts == 1:
+                return resolved, True
+        if len(resolved) == 1 and len(plain) == 1 and token_signature(resolved[0]) != token_signature(plain[0]):
+            return resolved, False
+        return plain, False
+
     for creator in creators:
-        raw.extend(split_authors(creator))
+        values, preserve_order = pick_authors(creator)
+        if preserve_order:
+            extend_ordered(values)
+        else:
+            raw.extend(values)
     if segment_author and re.search(r"[A-Za-z]", segment_author) and len(creators) <= 1:
-        raw.extend(split_authors(segment_author))
-    result = canonicalize_authors(raw)
+        values, preserve_order = pick_authors(segment_author)
+        if preserve_order:
+            extend_ordered(values)
+        else:
+            raw.extend(values)
+    result = list(ordered)
+    seen = {re.sub(r"[^a-z0-9]", "", item.lower()) for item in result}
+    for item in canonicalize_authors(raw):
+        key = re.sub(r"[^a-z0-9]", "", item.lower())
+        if key and key not in seen:
+            seen.add(key)
+            result.append(item)
     return " & ".join(result) if result else "Nieznany Autor"
 
 
 def build_online_query_variants(
     meta: EpubMetadata,
-    record: BookRecord,
+    prototype: Any,
     *,
     clean,
     clean_author_segment,
@@ -574,16 +729,16 @@ def build_online_query_variants(
             )
         )
 
-    record_authors = [part.strip() for part in record.author.split("&") if part.strip()] if record.author != "Nieznany Autor" else []
-    if not record_authors and " - " in record.title:
-        left, _, _ = record.title.partition(" - ")
+    prototype_authors = [part.strip() for part in prototype.author.split("&") if part.strip()] if prototype.author != "Nieznany Autor" else []
+    if not prototype_authors and " - " in prototype.title:
+        left, _, _ = prototype.title.partition(" - ")
         if looks_like_author_segment(left):
-            record_authors = [left]
-    cleaned_title = sanitize_title_for_online_query(record.title, record.author, record.series, record.volume)
+            prototype_authors = [left]
+    cleaned_title = sanitize_title_for_online_query(prototype.title, prototype.author, prototype.series, prototype.volume)
     if cleaned_title:
-        add_variant(cleaned_title, record_authors or list(meta.creators))
-        if record.series and record.series != "Standalone":
-            add_variant(f"{record.series} {cleaned_title}", record_authors or list(meta.creators))
-    if meta.title and clean(meta.title) != clean(record.title):
+        add_variant(cleaned_title, prototype_authors or list(meta.creators))
+        if prototype.series and prototype.series != "Standalone":
+            add_variant(f"{prototype.series} {cleaned_title}", prototype_authors or list(meta.creators))
+    if meta.title and clean(meta.title) != clean(prototype.title):
         add_variant(meta.title, list(meta.creators))
     return variants

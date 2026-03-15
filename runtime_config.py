@@ -114,6 +114,7 @@ APP_VERSION = "15.0"
 GUI_FOOTER_TEXT = "v15. 2026. Piotr Grechuta"
 DEFAULT_SOURCE_FOLDER = str(Path.cwd())
 DEFAULT_PROVIDERS = "google,openlibrary,crossref,hathitrust,lubimyczytac"
+DEFAULT_ONLINE_MODE = "PL"
 DEFAULT_HTTP_TIMEOUT = 8.0
 DEFAULT_INFER_WORKERS = 2
 ONLINE_ERROR_CACHE_TTL = 60.0

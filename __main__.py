@@ -1,4 +1,4 @@
-from app_cli import main
+from ebookRen import main
 
 
 if __name__ == "__main__":

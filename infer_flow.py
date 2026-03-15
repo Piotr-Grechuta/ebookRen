@@ -3,12 +3,189 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Iterable, TypeAlias
 
-from models_core import Candidate, EpubMetadata, OnlineCandidate, OnlineRoleEvidence, OnlineVerification
+from models_core import Candidate, EpubMetadata, LocalPrototype, OnlineCandidate, OnlineRoleEvidence, OnlineVerification
 
 RecordLike: TypeAlias = Any
 SplitAuthors: TypeAlias = Callable[[str], list[str]]
 AuthorMatchKeys: TypeAlias = Callable[[list[str]], set[str]]
 SimilarityScore: TypeAlias = Callable[[str | None, str | None], float]
+
+
+def _author_parts(text: str, *, split_authors, clean_author_segment) -> list[str]:
+    if not text:
+        return []
+    parts = [clean_author_segment(part) for part in split_authors(text)]
+    return [part for part in parts if part]
+
+
+def _author_shape_score(text: str, *, split_authors, clean_author_segment) -> tuple[int, int, int]:
+    particles = {
+        "al",
+        "bin",
+        "da",
+        "de",
+        "del",
+        "della",
+        "der",
+        "di",
+        "du",
+        "ibn",
+        "la",
+        "le",
+        "san",
+        "st",
+        "st.",
+        "van",
+        "von",
+    }
+    parts = _author_parts(text, split_authors=split_authors, clean_author_segment=clean_author_segment)
+    if not parts:
+        return (0, 0, 0)
+    long_tokens = 0
+    initials = 0
+    total_letters = 0
+    for part in parts:
+        for token in part.split():
+            lowered = token.lower().rstrip(".")
+            if lowered in particles:
+                continue
+            stripped = re.sub(r"[\W\d_]+", "", token, flags=re.UNICODE)
+            if not stripped:
+                continue
+            total_letters += len(stripped)
+            if len(stripped) == 1:
+                initials += 1
+            if len(stripped) >= 3:
+                long_tokens += 1
+    return (len(parts), long_tokens, total_letters - initials * 2)
+
+
+def should_preserve_current_multi_author(current_author: str, candidate_author: str, *, split_authors, clean_author_segment) -> bool:
+    current_parts = _author_parts(current_author, split_authors=split_authors, clean_author_segment=clean_author_segment)
+    candidate_parts = _author_parts(candidate_author, split_authors=split_authors, clean_author_segment=clean_author_segment)
+    if len(current_parts) < 2 or not candidate_parts:
+        return False
+    if len(candidate_parts) < len(current_parts):
+        return True
+    current_score = _author_shape_score(current_author, split_authors=split_authors, clean_author_segment=clean_author_segment)
+    candidate_score = _author_shape_score(candidate_author, split_authors=split_authors, clean_author_segment=clean_author_segment)
+    if candidate_score[1] < current_score[1]:
+        return True
+    if candidate_score[2] + 3 < current_score[2]:
+        return True
+    return False
+
+
+def candidate_genre_matches_record(candidate, record, *, split_authors, normalize_match_text, similarity_score, clean) -> bool:
+    def author_signature(text: str) -> tuple[str, ...]:
+        normalized = normalize_match_text(text)
+        if not normalized:
+            return ()
+        return tuple(sorted(part for part in normalized.split() if part))
+
+    genre = clean(getattr(candidate, "genre", ""))
+    if not genre:
+        return False
+    candidate_title = clean(getattr(candidate, "title", ""))
+    record_title = clean(getattr(record, "title", ""))
+    if not candidate_title or not record_title:
+        return False
+    title_match = normalize_match_text(candidate_title) == normalize_match_text(record_title) or similarity_score(candidate_title, record_title) >= 0.92
+    if not title_match:
+        return False
+    candidate_authors = [
+        author_signature(item)
+        for item in split_authors(getattr(candidate, "author", "") or " & ".join(getattr(candidate, "authors", []) or []))
+        if author_signature(item)
+    ]
+    record_authors = [author_signature(item) for item in split_authors(getattr(record, "author", "")) if author_signature(item)]
+    if record_authors and candidate_authors:
+        return bool(set(record_authors).intersection(candidate_authors))
+    return True
+
+
+def looks_like_structural_title_hint(text: str | None, *, clean) -> bool:
+    cleaned = clean(text)
+    if not cleaned:
+        return True
+    allowed_tokens = {
+        "book",
+        "cykl",
+        "czesc",
+        "ksiega",
+        "part",
+        "standalone",
+        "tom",
+        "vol",
+        "volume",
+    }
+    tokens = [
+        re.sub(r"[\W_]+", "", token, flags=re.UNICODE).lower()
+        for token in cleaned.split()
+    ]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return True
+    return all(token in allowed_tokens or token.isdigit() for token in tokens)
+
+
+def build_inference_metadata(
+    meta: EpubMetadata,
+    *,
+    clean,
+    clean_author_segment,
+    resolve_author_segment,
+) -> tuple[EpubMetadata, list[str]]:
+    title = clean(meta.title)
+    creators = [clean_author_segment(item) for item in meta.creators if clean_author_segment(item)]
+    notes: list[str] = []
+
+    title_authors = resolve_author_segment(title) if title else []
+    creator_authors = resolve_author_segment(" & ".join(creators)) if creators else []
+    if title_authors and not creator_authors:
+        creators = [clean_author_segment(item) for item in title_authors if clean_author_segment(item)]
+        title = ""
+        notes.append(f"metadata-swap:title->author={' | '.join(creators)}")
+
+    return (
+        EpubMetadata(
+            path=meta.path,
+            stem=meta.stem,
+            segments=list(meta.segments),
+            core=meta.core,
+            title=title,
+            creators=creators,
+            identifiers=list(meta.identifiers),
+            subjects=list(meta.subjects),
+            meta_series=meta.meta_series,
+            meta_volume=meta.meta_volume,
+            errors=list(meta.errors),
+        ),
+        notes,
+    )
+
+
+def build_record_from_local_prototype(
+    prototype: LocalPrototype,
+    *,
+    book_record_type,
+    extract_isbns,
+    meta: EpubMetadata,
+) -> object:
+    return book_record_type(
+        path=prototype.path,
+        author=prototype.author,
+        series=prototype.series,
+        volume=prototype.volume,
+        title=prototype.title,
+        source=prototype.source,
+        identifiers=extract_isbns(meta.identifiers),
+        notes=list(meta.errors),
+        genre=prototype.genre,
+        confidence=prototype.confidence,
+        review_reasons=[],
+        decision_reasons=[f"inference:{prototype.source}"],
+    )
 
 
 def is_strong_online_candidate(candidate: object, *, is_online_candidate, clean_series: Callable[[str | None], str]) -> bool:
@@ -345,6 +522,10 @@ def validate_record_components_with_online(
     strip_leading_title_index,
     sanitize_title,
     clean,
+    clean_author_segment,
+    split_authors,
+    similarity_score,
+    normalize_match_text,
     verification_type,
     extract_trailing_author_from_core,
 ) -> OnlineVerification:
@@ -357,21 +538,6 @@ def validate_record_components_with_online(
     series_confirmed = verification.series_confirmed
     volume_confirmed = verification.volume_confirmed
 
-    author_fragments: list[str] = [record.author]
-    author_fragments.extend(meta.creators)
-    author_fragments.append(extract_trailing_author_from_core(meta.core))
-    author_fragments.extend(part for part in re.split(r"\s+-\s+", meta.core) if part)
-
-    matched_author = None if author_confirmed else best_matching_online_text(author_fragments, initial_evidence.authors, author_role=True, threshold=0.9)
-    if matched_author:
-        canonical_author = matched_author
-        if canonical_author and canonical_author != record.author:
-            record.author = canonical_author
-            record.notes.append("online-role-author:applied")
-            record.decision_reasons.append("online-role-author:yes")
-            record.online_applied = True
-        author_confirmed = True
-
     supporting_online_candidates = [
         candidate
         for candidate in online_candidates
@@ -379,14 +545,53 @@ def validate_record_components_with_online(
     ]
     evidence = collect_online_role_evidence(supporting_online_candidates)
     if not any([evidence.authors, evidence.titles, evidence.series, evidence.volumes]):
-        return verification_type(
-            verification.checked,
-            author_confirmed,
-            title_confirmed,
-            series_confirmed,
-            volume_confirmed,
-            verification.providers,
-        )
+        if record.author == "Nieznany Autor" and len(initial_evidence.authors) == 1:
+            fallback_author = best_matching_online_text(
+                [record.title, meta.title, meta.core, *meta.creators],
+                initial_evidence.authors,
+                author_role=True,
+                threshold=0.9,
+            )
+            if fallback_author and not should_preserve_current_multi_author(
+                record.author,
+                fallback_author,
+                split_authors=split_authors,
+                clean_author_segment=clean_author_segment,
+            ):
+                record.author = fallback_author
+                record.notes.append("online-role-author:applied")
+                record.decision_reasons.append("online-role-author:yes")
+                record.online_applied = True
+                author_confirmed = True
+                evidence = initial_evidence
+        if not any([evidence.authors, evidence.titles, evidence.series, evidence.volumes]):
+            return verification_type(
+                verification.checked,
+                author_confirmed,
+                title_confirmed,
+                series_confirmed,
+                volume_confirmed,
+                verification.providers,
+            )
+
+    author_fragments: list[str] = [record.author]
+    author_fragments.extend(meta.creators)
+    author_fragments.append(extract_trailing_author_from_core(meta.core))
+
+    matched_author = None if author_confirmed else best_matching_online_text(author_fragments, evidence.authors, author_role=True, threshold=0.9)
+    if matched_author:
+        canonical_author = matched_author
+        if canonical_author and canonical_author != record.author and not should_preserve_current_multi_author(
+            record.author,
+            canonical_author,
+            split_authors=split_authors,
+            clean_author_segment=clean_author_segment,
+        ):
+            record.author = canonical_author
+            record.notes.append("online-role-author:applied")
+            record.decision_reasons.append("online-role-author:yes")
+            record.online_applied = True
+        author_confirmed = True
 
     if (record.series == "Standalone" or not series_confirmed) and evidence.series:
         series_applied = False
@@ -508,7 +713,14 @@ def validate_record_components_with_online(
             (
                 clean(candidate.genre)
                 for candidate in sorted(supporting_online_candidates, key=lambda item: item.score, reverse=True)
-                if clean(candidate.genre)
+                if candidate_genre_matches_record(
+                    candidate,
+                    record,
+                    split_authors=split_authors,
+                    normalize_match_text=normalize_match_text,
+                    similarity_score=similarity_score,
+                    clean=clean,
+                )
             ),
             "",
         )
@@ -534,6 +746,7 @@ def infer_record(
     providers,
     timeout,
     *,
+    online_mode,
     parse_existing_filename,
     book_record_type,
     extract_isbns,
@@ -545,9 +758,12 @@ def infer_record(
     looks_like_author_segment,
     extract_trailing_author_from_core,
     extract_authors,
+    parse_hybrid_local,
     collect_title_candidates,
     collect_core_candidates,
     collect_segment_candidates,
+    choose_best_local_series_candidate,
+    choose_best_local_title_candidate,
     choose_series_candidate,
     choose_title_candidate,
     sanitize_title,
@@ -562,6 +778,8 @@ def infer_record(
     pick_best_online_match,
     build_online_record,
     split_authors,
+    normalize_match_text,
+    resolve_author_segment,
     online_candidate_supports_record_context_fn,
     collect_online_candidate_candidates,
     source_needs_online_verification,
@@ -572,6 +790,9 @@ def infer_record(
     emit_stage=None,
     emit_trace=None,
 ) -> object:
+    inference_meta = meta
+    inference_meta_notes: list[str] = []
+
     def trace_state(label: str, current_record=None, extra: list[str] | None = None) -> None:
         if emit_trace is None:
             return
@@ -581,6 +802,10 @@ def infer_record(
             lines.append(f"  meta.title: {meta.title}")
         if meta.creators:
             lines.append(f"  meta.creators: {' | '.join(meta.creators)}")
+        if inference_meta.title != meta.title:
+            lines.append(f"  meta.title-roboczy: {inference_meta.title or '(brak)'}")
+        if inference_meta.creators != meta.creators:
+            lines.append(f"  meta.creators-roboczy: {' | '.join(inference_meta.creators) or '(brak)'}")
         if meta.meta_series or meta.meta_volume is not None:
             lines.append(f"  meta.series: {meta.meta_series or '(brak)'}")
             lines.append(f"  meta.volume: {meta.meta_volume}")
@@ -590,6 +815,8 @@ def infer_record(
             lines.append(f"  volume: {current_record.volume}")
             lines.append(f"  title: {current_record.title}")
             lines.append(f"  source: {current_record.source}")
+        if inference_meta_notes:
+            lines.extend(f"  {item}" for item in inference_meta_notes)
         if extra:
             lines.extend(f"  {item}" for item in extra if item)
         emit_trace("\n".join(lines))
@@ -602,36 +829,58 @@ def infer_record(
                 target_meta,
                 providers,
                 timeout,
+                online_mode=online_mode,
                 emit_stage=emit_stage,
                 query_label=label,
             )
         except TypeError as exc:
-            if "emit_stage" not in str(exc) and "query_label" not in str(exc):
+            if "emit_stage" not in str(exc) and "query_label" not in str(exc) and "online_mode" not in str(exc):
                 raise
             return fetch_online_candidates(target_meta, providers, timeout)
+
+    inference_meta, inference_meta_notes = build_inference_metadata(
+        meta,
+        clean=clean,
+        clean_author_segment=clean_author_segment,
+        resolve_author_segment=resolve_author_segment,
+    )
 
     existing = parse_existing_filename(meta.stem)
     candidates: list[Candidate] = []
     author_from_trailing_core = False
     title_from_core = False
+    local_prototype: LocalPrototype | None = None
     if existing is not None:
         author, series, volume, title, genre = existing
-        record = book_record_type(
+        local_prototype = LocalPrototype(
             path=meta.path,
             author=author,
             series=series or "Standalone",
             volume=volume,
             title=title or "Bez tytulu",
+            genre=infer_book_genre(meta.subjects),
             source="existing-format",
-            identifiers=extract_isbns(meta.identifiers),
-            notes=list(meta.errors),
-            genre=genre or infer_book_genre(meta.subjects),
             confidence=100,
-            review_reasons=[],
-            decision_reasons=["existing-format"],
+            title_from_core=False,
+        )
+        record = build_record_from_local_prototype(
+            local_prototype,
+            book_record_type=book_record_type,
+            extract_isbns=extract_isbns,
+            meta=meta,
         )
         if emit_stage is not None:
             emit_stage("lokalne-dopasowanie", record.source)
+        trace_state(
+            "prototyp-lokalny",
+            record,
+            [
+                f"prototype.author: {local_prototype.author}",
+                f"prototype.series: {local_prototype.series}",
+                f"prototype.volume: {local_prototype.volume}",
+                f"prototype.title: {local_prototype.title}",
+            ],
+        )
         trace_state("lokalne-dopasowanie", record)
         if not (use_online and existing_format_needs_online_verification(record)):
             final_record = finalize_record_quality(record, meta, 100, title_from_core=False)
@@ -643,27 +892,51 @@ def infer_record(
             add_candidate(candidates, record.series, record.volume, 100, "existing-format", record.title)
         base_confidence = 100
     else:
+        hybrid_local = parse_hybrid_local(inference_meta)
         segment_author = ""
-        if len(meta.segments) > 1:
-            second = clean_author_segment(meta.segments[1])
+        discarded_segment_title = ""
+        if len(inference_meta.segments) > 1:
+            second = clean_author_segment(inference_meta.segments[1])
             if looks_like_author_segment(second):
                 segment_author = second
-        if not segment_author and not meta.creators:
-            segment_author = extract_trailing_author_from_core(meta.core)
+        if not segment_author and hybrid_local.author_hint:
+            segment_author = clean_author_segment(hybrid_local.author_hint)
+        if not segment_author and not inference_meta.creators:
+            segment_author = extract_trailing_author_from_core(inference_meta.core)
             author_from_trailing_core = bool(segment_author)
+        if segment_author and inference_meta.creators:
+            creator_authors = resolve_author_segment(" & ".join(inference_meta.creators))
+            segment_authors = resolve_author_segment(segment_author)
+            if creator_authors and not segment_authors:
+                discarded_segment_title = segment_author
+                segment_author = ""
 
-        author = extract_authors(meta.creators, segment_author)
+        author = extract_authors(inference_meta.creators, segment_author)
+        bracketed_series_title_hint = bool(re.search(r"\[[^\]]*\d[^\]]*\]", hybrid_local.title_hint))
+        prefer_leading_author_title = (
+            hybrid_local.source == "hybrid:delimited-author-title"
+            and bool(hybrid_local.title_hint)
+            and not bracketed_series_title_hint
+        )
 
-        if meta.meta_series:
-            add_candidate(candidates, meta.meta_series, meta.meta_volume, 100, "opf")
-        collect_title_candidates(meta.title, candidates)
-        collect_core_candidates(meta.core, candidates)
-        collect_segment_candidates(meta.segments, candidates)
+        if inference_meta.meta_series:
+            add_candidate(candidates, inference_meta.meta_series, inference_meta.meta_volume, 100, "opf")
+        collect_title_candidates(inference_meta.title, candidates)
+        if hybrid_local.title_hint and clean(hybrid_local.title_hint) != clean(inference_meta.title):
+            collect_title_candidates(hybrid_local.title_hint, candidates)
+            bracketed_series_suffix = re.search(r"\[([^\]]+)\]\s*$", inference_meta.core)
+            if bracketed_series_suffix and hybrid_local.source == "hybrid:delimited-title-author":
+                bracketed_title = clean(f"{hybrid_local.title_hint} [{bracketed_series_suffix.group(1)}]")
+                if bracketed_title and bracketed_title != clean(hybrid_local.title_hint):
+                    collect_title_candidates(bracketed_title, candidates)
+        if not prefer_leading_author_title:
+            collect_core_candidates(inference_meta.core, candidates)
+            collect_segment_candidates(inference_meta.segments, candidates)
 
         if candidates:
-            best_series = choose_series_candidate(candidates)
-            best_title = choose_title_candidate(candidates)
+            best_series = choose_best_local_series_candidate(inference_meta, candidates)
             assert best_series is not None
+            best_title = choose_best_local_title_candidate(inference_meta, candidates, best_series.series)
             series = best_series.series
             volume = best_series.volume
             title_override = best_title.title_override if best_title else best_series.title_override
@@ -676,19 +949,39 @@ def infer_record(
             series = "Standalone"
             volume = None
             title_override = None
-            source = "fallback"
-            base_confidence = 45
+            source = hybrid_local.source or "fallback"
+            base_confidence = max(45, hybrid_local.confidence)
 
-        local_title = sanitize_title(meta.title, series, volume)
+        if discarded_segment_title and looks_like_structural_title_hint(title_override, clean=clean):
+            title_override = clean(discarded_segment_title)
+            if source:
+                source = f"{source}+discarded-segment-title"
+
+        if prefer_leading_author_title:
+            series = "Standalone"
+            volume = None
+            title_override = clean(hybrid_local.title_hint)
+            source = hybrid_local.source
+            base_confidence = max(base_confidence, hybrid_local.confidence)
+
+        local_title = sanitize_title(inference_meta.title, series, volume)
         fallback_title = ""
         if not title_override and not local_title:
-            fallback_title = strip_leading_title_index(meta.core)
+            fallback_title = clean(hybrid_local.title_hint) or strip_leading_title_index(inference_meta.core)
             if segment_author and " - " in fallback_title:
                 head, _, tail = fallback_title.rpartition(" - ")
                 if clean(tail) == clean(segment_author):
                     fallback_title = clean(head)
-        title = title_override or local_title or fallback_title or clean(meta.core)
+        title = title_override or local_title or fallback_title or clean(inference_meta.core)
         title_from_core = not bool(title_override or local_title)
+        author_only_core = (
+            source == "fallback"
+            and not inference_meta.title
+            and not inference_meta.creators
+            and " - " not in inference_meta.core
+            and " -- " not in inference_meta.core
+            and bool(inference_meta.core)
+        )
         if local_title and title_override:
             if len(title_override) > len(local_title) + 12 or hex_noise_re.search(title_override) or anna_archive_re.search(title_override):
                 title = local_title
@@ -697,26 +990,65 @@ def infer_record(
         title = strip_author_from_title(title, author)
         title = clean(anna_archive_re.sub("", title))
         title = sanitize_title(title, series, volume)
+        if title and author_only_core and (
+            normalize_match_text(title) == normalize_match_text(author)
+            or normalize_match_text(extract_authors([], title)) == normalize_match_text(author)
+        ):
+            title = "Bez tytulu"
+            title_from_core = False
         notes = list(meta.errors)
 
-        record = book_record_type(
+        local_prototype = LocalPrototype(
             path=meta.path,
             author=author,
             series=clean_series(series) or "Standalone",
             volume=volume,
             title=title,
+            genre=infer_book_genre(inference_meta.subjects),
             source=source,
-            identifiers=extract_isbns(meta.identifiers),
-            notes=notes,
-            genre=infer_book_genre(meta.subjects),
             confidence=base_confidence,
-            review_reasons=[],
-            decision_reasons=[f"inference:{source}"],
+            title_from_core=title_from_core,
+            author_from_trailing_core=author_from_trailing_core,
+        )
+        record = build_record_from_local_prototype(
+            local_prototype,
+            book_record_type=book_record_type,
+            extract_isbns=extract_isbns,
+            meta=meta,
         )
         if emit_stage is not None:
             emit_stage("lokalne-dopasowanie", record.source)
+        trace_state(
+            "prototyp-lokalny",
+            record,
+            [
+                f"prototype.author: {local_prototype.author}",
+                f"prototype.series: {local_prototype.series}",
+                f"prototype.volume: {local_prototype.volume}",
+                f"prototype.title: {local_prototype.title}",
+            ],
+        )
         trace_state("lokalne-dopasowanie", record)
+    assert local_prototype is not None
     online_candidates: list[OnlineCandidate] = []
+    lubimyczytac_truth_applied = False
+    normalized_online_mode = str(online_mode or "").strip().upper()
+
+    def should_stop_pl_variants(candidates: list[OnlineCandidate]) -> bool:
+        if normalized_online_mode != "PL" or not candidates:
+            return False
+        expected_title_keys = {
+            normalize_match_text(value)
+            for value in (local_prototype.title, inference_meta.title, inference_meta.core)
+            if clean(value)
+        }
+        return any(
+            candidate.provider == "lubimyczytac"
+            and is_strong_online_candidate(candidate, is_online_candidate=lambda current: True, clean_series=clean_series)
+            and normalize_match_text(candidate.title) in expected_title_keys
+            for candidate in candidates
+        )
+
     if use_online and (
         record.source == "existing-format"
         or record.source == "online-aggregate"
@@ -726,17 +1058,20 @@ def infer_record(
         or record.author == "Nieznany Autor"
         or source_needs_online_verification(record.source)
     ):
-        online_candidates = fetch_online_candidates_with_progress(meta, "wariant=oryginal")
-        variants = build_online_query_variants(meta, record)
-        for variant_index, variant in enumerate(variants, start=1):
-            variant_label = variant.title or variant.core or f"wariant-{variant_index}"
-            online_candidates.extend(
-                fetch_online_candidates_with_progress(
-                    variant,
-                    f"wariant={variant_index}/{len(variants)}:{variant_label}",
+        online_candidates = fetch_online_candidates_with_progress(inference_meta, "wariant=oryginal")
+        if not should_stop_pl_variants(online_candidates):
+            variants = build_online_query_variants(inference_meta, local_prototype)
+            for variant_index, variant in enumerate(variants, start=1):
+                variant_label = variant.title or variant.core or f"wariant-{variant_index}"
+                online_candidates.extend(
+                    fetch_online_candidates_with_progress(
+                        variant,
+                        f"wariant={variant_index}/{len(variants)}:{variant_label}",
+                    )
                 )
-            )
-        best_online = pick_best_online_match(meta, online_candidates)
+                if should_stop_pl_variants(online_candidates):
+                    break
+        best_online = pick_best_online_match(inference_meta, online_candidates)
         if emit_stage is not None:
             if best_online is None:
                 emit_stage("sprawdzenie-online", "brak wiarygodnego wyniku")
@@ -745,7 +1080,7 @@ def infer_record(
                     "sprawdzenie-online",
                     f"wybrano: {best_online.title or '(brak tytulu)'} | score={best_online.score}",
                 )
-        online = build_online_record(meta, best_online) if best_online is not None else None
+        online = build_online_record(inference_meta, best_online) if best_online is not None else None
         if online:
             record.online_checked = True
             record.notes.append(f"online-checked:{online.source}")
@@ -775,76 +1110,162 @@ def infer_record(
                     f"online.genre: {online.genre}",
                 ],
             )
-            blocked_online = any(reason in {"online-niejednoznaczne", "online-best-effort"} for reason in online.review_reasons)
-            if not blocked_online and online_candidate_supports_record_context_fn(record, meta, online_context_candidate):
-                online_applied = False
-                if record.author == "Nieznany Autor" and online.author != "Nieznany Autor":
+            online_applied = False
+            best_online_providers = list(getattr(best_online, "providers", [])) if best_online is not None else []
+            best_online_provider = str(getattr(best_online, "provider", "")) if best_online is not None else ""
+            best_online_source = str(getattr(best_online, "source", "")) if best_online is not None else ""
+            lubimyczytac_best_match = (
+                "lubimyczytac" in best_online_providers
+                or best_online_provider == "lubimyczytac"
+                or "lubimyczytac" in best_online_source
+            )
+            if (
+                str(online_mode or "").upper().startswith("PL")
+                and best_online is not None
+                and lubimyczytac_best_match
+                and online_candidate_supports_record_context_fn(record, inference_meta, online_context_candidate)
+            ):
+                if (
+                    online.author
+                    and online.author != "Nieznany Autor"
+                    and not should_preserve_current_multi_author(
+                        record.author,
+                        online.author,
+                        split_authors=split_authors,
+                        clean_author_segment=clean_author_segment,
+                    )
+                ):
                     record.author = online.author
-                    online_applied = True
-                if not record.genre and online.genre:
-                    record.genre = clean(online.genre)
-                    online_applied = True
-                if (not record.title or hex_noise_re.search(record.title) or anna_archive_re.search(record.title)) and online.title:
+                if online.title:
                     record.title = online.title
                     title_from_core = False
-                    online_applied = True
-                if online.title or online.series:
-                    online_title_candidates = collect_online_candidate_candidates(
-                        online_candidate_type(
-                            provider="aggregate",
-                            source=online.source,
-                            title=online.title,
-                            authors=split_authors(online.author),
-                            identifiers=list(online.identifiers),
-                            score=max(96, online.confidence),
-                            reason="aggregate",
-                            series=online.series,
-                            volume=online.volume,
-                            genre=online.genre,
-                        )
+                record.series = clean_series(online.series) or "Standalone"
+                record.volume = online.volume
+                if online.genre:
+                    record.genre = clean(online.genre)
+                record.online_applied = True
+                record.notes.append("online-truth:lubimyczytac")
+                record.decision_reasons.append("online-truth:lubimyczytac")
+                record.decision_reasons.extend(reason for reason in online.decision_reasons if reason not in record.decision_reasons)
+                record.review_reasons = [
+                    reason
+                    for reason in record.review_reasons
+                    if reason
+                    not in {
+                        "online-best-effort",
+                        "online-niejednoznaczne",
+                        "nieznany-autor",
+                        "brak-tytulu",
+                        "fallback",
+                        "szum-w-tytule",
+                        "artefakt-zrodla",
+                        "online-brak-potwierdzenia-autora",
+                        "online-brak-potwierdzenia-serii",
+                        "online-brak-potwierdzenia-tytulu",
+                        "online-brak-potwierdzenia-tomu",
+                    }
+                ]
+                base_confidence = max(base_confidence, online.confidence)
+                author_from_trailing_core = False
+                lubimyczytac_truth_applied = True
+                trace_state("online-zastosowany", record, ["truth-source: lubimyczytac"])
+            else:
+                if "lubimyczytac" in online.source and online.author != "Nieznany Autor" and record.author != online.author:
+                    current_author_keys = sorted(
+                        key for key in (normalize_match_text(part) for part in record.author.split("&")) if key
                     )
-                    if online_title_candidates:
-                        best_online_series = choose_series_candidate(online_title_candidates)
-                        best_online_title = choose_title_candidate(online_title_candidates)
-                        if best_online_title and (
-                            not record.title
-                            or hex_noise_re.search(record.title)
-                            or anna_archive_re.search(record.title)
-                        ):
-                            record.title = best_online_title.title_override or record.title
-                            online_applied = True
-                        if best_online_series and (
-                            record.series == "Standalone"
-                            or record.volume is None
-                            or record.source.startswith("core:spaced")
-                            or record.source.startswith("core:index-only")
-                        ):
-                            new_series = clean_series(best_online_series.series) or record.series
-                            if new_series != record.series:
-                                record.series = new_series
+                    online_author_keys = sorted(
+                        key for key in (normalize_match_text(part) for part in online.author.split("&")) if key
+                    )
+                    if current_author_keys and current_author_keys == online_author_keys and not should_preserve_current_multi_author(
+                        record.author,
+                        online.author,
+                        split_authors=split_authors,
+                        clean_author_segment=clean_author_segment,
+                    ):
+                        record.author = online.author
+                        online_applied = True
+                blocked_online = any(reason in {"online-niejednoznaczne", "online-best-effort"} for reason in online.review_reasons)
+                if not blocked_online and online_candidate_supports_record_context_fn(record, inference_meta, online_context_candidate):
+                    if (
+                        record.author == "Nieznany Autor"
+                        and online.author != "Nieznany Autor"
+                        and not should_preserve_current_multi_author(
+                            record.author,
+                            online.author,
+                            split_authors=split_authors,
+                            clean_author_segment=clean_author_segment,
+                        )
+                    ):
+                        record.author = online.author
+                        online_applied = True
+                    if not record.genre and online.genre:
+                        record.genre = clean(online.genre)
+                        online_applied = True
+                    if (not record.title or hex_noise_re.search(record.title) or anna_archive_re.search(record.title)) and online.title:
+                        record.title = online.title
+                        title_from_core = False
+                        online_applied = True
+                    if online.title or online.series:
+                        online_title_candidates = collect_online_candidate_candidates(
+                            online_candidate_type(
+                                provider="aggregate",
+                                source=online.source,
+                                title=online.title,
+                                authors=split_authors(online.author),
+                                identifiers=list(online.identifiers),
+                                score=max(96, online.confidence),
+                                reason="aggregate",
+                                series=online.series,
+                                volume=online.volume,
+                                genre=online.genre,
+                            )
+                        )
+                        if online_title_candidates:
+                            best_online_series = choose_series_candidate(online_title_candidates)
+                            best_online_title = choose_title_candidate(online_title_candidates)
+                            if best_online_title and (
+                                not record.title
+                                or hex_noise_re.search(record.title)
+                                or anna_archive_re.search(record.title)
+                            ):
+                                record.title = best_online_title.title_override or record.title
                                 online_applied = True
-                        if best_online_series and (
-                            record.volume is None
-                            or record.volume == (0, "00")
-                            or record.source.startswith("core:spaced")
-                            or record.source.startswith("core:index-only")
-                        ):
-                            if best_online_series.volume != record.volume:
-                                record.volume = best_online_series.volume
-                                online_applied = True
-                        record.title = sanitize_title(record.title, record.series, record.volume) or record.title
-                if online_applied:
-                    record.online_applied = True
-                    record.notes.append(f"online-applied:{online.source}")
-                    record.decision_reasons.extend(online.decision_reasons)
-                    base_confidence = max(base_confidence, online.confidence)
-                    trace_state("online-zastosowany", record)
+                            if best_online_series and (
+                                record.series == "Standalone"
+                                or record.volume is None
+                                or record.source.startswith("core:spaced")
+                                or record.source.startswith("core:index-only")
+                            ):
+                                new_series = clean_series(best_online_series.series) or record.series
+                                if new_series != record.series:
+                                    record.series = new_series
+                                    online_applied = True
+                            if best_online_series and (
+                                record.volume is None
+                                or record.volume == (0, "00")
+                                or record.source.startswith("core:spaced")
+                                or record.source.startswith("core:index-only")
+                            ):
+                                if best_online_series.volume != record.volume:
+                                    record.volume = best_online_series.volume
+                                    online_applied = True
+                            record.title = sanitize_title(record.title, record.series, record.volume) or record.title
+                    if online_applied:
+                        record.online_applied = True
+                        record.notes.append(f"online-applied:{online.source}")
+                        record.decision_reasons.extend(online.decision_reasons)
+                        base_confidence = max(base_confidence, online.confidence)
+                        trace_state("online-zastosowany", record)
 
     if use_online:
         if emit_stage is not None:
             emit_stage("walidacja", record.source)
-        verification = verify_record_against_online_fn(record, meta, online_candidates)
-        verification = validate_record_components_with_online_fn(record, meta, candidates, online_candidates, verification)
+        if lubimyczytac_truth_applied:
+            verification = verify_record_against_online_fn(record, inference_meta, online_candidates)
+        else:
+            verification = verify_record_against_online_fn(record, inference_meta, online_candidates)
+            verification = validate_record_components_with_online_fn(record, inference_meta, candidates, online_candidates, verification)
         trace_state(
             "walidacja",
             record,
@@ -870,7 +1291,7 @@ def infer_record(
                 record.author = "Nieznany Autor"
                 record.review_reasons.append("online-brak-potwierdzenia-autora")
                 base_confidence = min(base_confidence, 52)
-            if source_needs_online_verification(record.source):
+            if not lubimyczytac_truth_applied and source_needs_online_verification(record.source):
                 if record.series != "Standalone" and not verification.series_confirmed:
                     record.review_reasons.append("online-brak-potwierdzenia-serii")
                     base_confidence = min(base_confidence, 60)
@@ -883,10 +1304,24 @@ def infer_record(
             clear_strong_lubimyczytac_review_fn(record, verification)
 
     if not record.title:
-        fallback_title = sanitize_title(meta.core, record.series, record.volume)
+        fallback_title = sanitize_title(inference_meta.core, record.series, record.volume)
         if fallback_title:
-            record.title = fallback_title
-            title_from_core = True
+            if (
+                record.source == "fallback"
+                and not inference_meta.title
+                and not inference_meta.creators
+                and " - " not in inference_meta.core
+                and " -- " not in inference_meta.core
+                and (
+                    normalize_match_text(fallback_title) == normalize_match_text(record.author)
+                    or normalize_match_text(extract_authors([], fallback_title)) == normalize_match_text(record.author)
+                )
+            ):
+                record.title = "Bez tytulu"
+                title_from_core = False
+            else:
+                record.title = fallback_title
+                title_from_core = True
         else:
             record.title = "Bez tytulu"
     if not record.series:

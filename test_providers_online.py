@@ -3,7 +3,7 @@ import re
 
 import infer_core
 import providers_online
-from models_core import LubimyczytacResult
+from models_core import LubimyczytacResult, OnlineCandidate
 from runtime_config import SERIES_ONLY_PAREN_INDEX_RE
 
 
@@ -51,6 +51,63 @@ class ProvidersOnlineTests(unittest.TestCase):
         self.assertEqual(series, "Czerwona Królowa")
         self.assertEqual(volume, (1, "00"))
         self.assertEqual(genres, ["fantasy", "science fiction"])
+
+    def test_fetch_online_candidates_prefers_lubimyczytac_first_in_pl_mode(self) -> None:
+        calls: list[str] = []
+
+        def provider(name: str, results: list[OnlineCandidate]):
+            def _provider(meta, timeout):
+                del meta, timeout
+                calls.append(name)
+                return results
+            return _provider
+
+        providers_online.fetch_online_candidates(
+            object(),
+            ["google", "lubimyczytac", "openlibrary"],
+            2.0,
+            online_mode="PL",
+            provider_functions={
+                "google": provider("google", []),
+                "openlibrary": provider("openlibrary", []),
+                "lubimyczytac": provider(
+                    "lubimyczytac",
+                    [OnlineCandidate("lubimyczytac", "lubimyczytac", "Book", ["Author"], [], 286, "title-author-exact")],
+                ),
+            },
+        )
+
+        self.assertEqual(calls, ["lubimyczytac"])
+
+    def test_fetch_online_candidates_skips_lubimyczytac_after_strong_google_hit_in_en_mode(self) -> None:
+        calls: list[str] = []
+
+        def provider(name: str, results: list[OnlineCandidate]):
+            def _provider(meta, timeout):
+                del meta, timeout
+                calls.append(name)
+                return results
+            return _provider
+
+        providers_online.fetch_online_candidates(
+            object(),
+            ["google", "lubimyczytac", "openlibrary"],
+            2.0,
+            online_mode="EN",
+            provider_functions={
+                "google": provider(
+                    "google",
+                    [OnlineCandidate("google-books", "google-books", "Book", ["Author"], [], 338, "title-author-exact")],
+                ),
+                "openlibrary": provider("openlibrary", []),
+                "lubimyczytac": provider(
+                    "lubimyczytac",
+                    [OnlineCandidate("lubimyczytac", "lubimyczytac", "Book", ["Author"], [], 286, "title-author-exact")],
+                ),
+            },
+        )
+
+        self.assertEqual(calls, ["google"])
 
 
 if __name__ == "__main__":

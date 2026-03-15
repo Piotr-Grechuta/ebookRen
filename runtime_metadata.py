@@ -23,6 +23,13 @@ def read_book_metadata(
     if path.suffix.lower() != ".epub":
         return meta
 
+    if epub_module is None:
+        try:
+            from ebooklib import epub as epub_module  # type: ignore[import-not-found]
+        except Exception as exc:
+            meta.errors.append(f"epub-read: {exc}")
+            return meta
+
     try:
         book = epub_module.read_epub(str(path), options={"ignore_ncx": True})
         meta.title = clean(book.get_metadata("DC", "title")[0][0]) if book.get_metadata("DC", "title") else ""

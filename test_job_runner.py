@@ -25,6 +25,7 @@ class DummyRecord:
     online_checked: bool = False
     online_applied: bool = False
     output_folder: Path | None = None
+    archive_source_path: Path | None = None
 
     @property
     def needs_review(self) -> bool:
@@ -99,7 +100,7 @@ class JobRunnerTests(unittest.TestCase):
         self.assertIn("online-role-title", lines[1])
         self.assertEqual(lines[2], "  wynik: source.epub -> Author - Series - Tom 01.00 - Title.epub")
 
-    def test_dedupe_destinations_adds_suffix(self) -> None:
+    def test_dedupe_destinations_moves_existing_conflict_to_dubel_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
             (folder / "Author - Series - Tom 01.00 - Title.epub").write_text("x", encoding="utf-8")
@@ -110,14 +111,41 @@ class JobRunnerTests(unittest.TestCase):
                 is_supported_book_file=lambda path: path.suffix == ".epub",
                 make_record_clone=lambda base, **kwargs: DummyRecord(
                     path=base.path,
-                    filename=f"Author - Series - Tom 01.00 - Title {kwargs['filename_suffix']}.epub",
+                    filename=f"Author - Series - Tom 01.00 - Title {kwargs['filename_suffix']}.epub" if kwargs.get("filename_suffix") else base.filename,
                     notes=kwargs["notes"],
                     confidence=kwargs["confidence"],
                     review_reasons=kwargs["review_reasons"],
                     decision_reasons=kwargs["decision_reasons"],
+                    output_folder=kwargs.get("output_folder"),
+                ),
+            )
+        self.assertEqual(deduped[0].filename, "Author - Series - Tom 01.00 - Title.epub")
+        self.assertEqual(deduped[0].output_folder, folder / "dubel")
+
+    def test_dedupe_destinations_adds_suffix_inside_dubel_when_name_already_taken(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            dubel = folder / "dubel"
+            dubel.mkdir()
+            (folder / "Author - Series - Tom 01.00 - Title.epub").write_text("x", encoding="utf-8")
+            (dubel / "Author - Series - Tom 01.00 - Title.epub").write_text("x", encoding="utf-8")
+            record = DummyRecord(path=folder / "source.epub", filename="Author - Series - Tom 01.00 - Title.epub")
+            deduped = job_runner.dedupe_destinations(
+                [record],
+                folder,
+                is_supported_book_file=lambda path: path.suffix == ".epub",
+                make_record_clone=lambda base, **kwargs: DummyRecord(
+                    path=base.path,
+                    filename=f"Author - Series - Tom 01.00 - Title {kwargs['filename_suffix']}.epub" if kwargs.get("filename_suffix") else base.filename,
+                    notes=kwargs["notes"],
+                    confidence=kwargs["confidence"],
+                    review_reasons=kwargs["review_reasons"],
+                    decision_reasons=kwargs["decision_reasons"],
+                    output_folder=kwargs.get("output_folder", base.output_folder),
                 ),
             )
         self.assertEqual(deduped[0].filename, "Author - Series - Tom 01.00 - Title (1).epub")
+        self.assertEqual(deduped[0].output_folder, dubel)
 
     def test_write_report_emits_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,6 +181,31 @@ class JobRunnerTests(unittest.TestCase):
         self.assertIn("wpisy: 2", lines[1])
         self.assertIn("zgodne z obecnym folderem: 1", lines[2])
         self.assertIn("pomijanie: wlaczone", lines[3])
+
+    def test_sort_paths_windows_style_matches_windows_logical_order(self) -> None:
+        paths = [
+            Path("[10] a.epub"),
+            Path("A.epub"),
+            Path("[2] a.epub"),
+            Path("(03) a.epub"),
+        ]
+
+        sorted_paths = job_runner.sort_paths_windows_style(paths)
+
+        self.assertEqual(
+            [path.name for path in sorted_paths],
+            ["(03) a.epub", "[2] a.epub", "[10] a.epub", "A.epub"],
+        )
+
+    def test_assign_archive_source_paths_avoids_existing_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_folder = Path(tmp)
+            (archive_folder / "source.epub").write_text("old", encoding="utf-8")
+            records = [DummyRecord(path=Path("src") / "source.epub", filename="target.epub")]
+
+            job_runner.assign_archive_source_paths(records, archive_folder)
+
+            self.assertEqual(records[0].archive_source_path, archive_folder / "source (1).epub")
 
 
 if __name__ == "__main__":

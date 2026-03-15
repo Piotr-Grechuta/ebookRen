@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+import candidate_scorer as candidate_scorer_mod
 import infer_core as infer_core_mod
 from models_core import EpubMetadata, OnlineCandidate, RankedOnlineMatch
 
@@ -65,6 +66,7 @@ class BookRecord:
     decision_reasons: list[str] = field(default_factory=list)
     filename_suffix: str = ""
     output_folder: Path | None = None
+    archive_source_path: Path | None = None
     online_checked: bool = False
     online_applied: bool = False
 
@@ -107,6 +109,18 @@ def author_match_keys(values: Iterable[str]) -> set[str]:
             if normalized:
                 keys.add(normalized)
     return keys
+
+
+def extract_authors_preserving_order(values: Iterable[str]) -> str:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = infer_core_mod.to_last_first(value)
+        key = infer_core_mod.author_key(normalized)
+        if normalized and key and key not in seen:
+            seen.add(key)
+            ordered.append(normalized)
+    return " & ".join(ordered) if ordered else "Nieznany Autor"
 
 
 def rank_online_candidate(
@@ -191,6 +205,16 @@ def build_online_candidates(
             continue
         score, reason = rank_online_candidate(meta, cleaned_title, cleaned_authors, cleaned_identifiers, split_authors=split_authors)
         score += provider_score_adjustments.get(provider_label, 0)
+        score += candidate_scorer_mod.online_candidate_provider_bias(
+            meta,
+            provider_label=provider_label,
+            title=cleaned_title,
+            reason=reason,
+            clean=infer_core_mod.clean,
+            normalize_match_text=infer_core_mod.normalize_match_text,
+            fold_text=infer_core_mod.fold_text,
+            strip_leading_title_index=infer_core_mod.clean,
+        )
         ranked.append(
             OnlineCandidate(
                 provider=provider_label,
@@ -234,26 +258,12 @@ def aggregate_online_candidates(candidates: Iterable[OnlineCandidate]) -> list[R
     for group in grouped.values():
         providers: list[str] = []
         sources: list[str] = []
-        identifiers: list[str] = []
         best = max(group, key=lambda item: item.score)
-        series = ""
-        volume: tuple[int, str] | None = None
-        genre = ""
         for item in group:
             if item.provider not in providers:
                 providers.append(item.provider)
             if item.source not in sources:
                 sources.append(item.source)
-            for identifier in item.identifiers:
-                normalized = infer_core_mod.clean(identifier)
-                if normalized and normalized not in identifiers:
-                    identifiers.append(normalized)
-            if not series and infer_core_mod.clean_series(item.series):
-                series = infer_core_mod.clean_series(item.series)
-            if volume is None and item.volume is not None:
-                volume = item.volume
-            if not genre and infer_core_mod.clean(item.genre):
-                genre = infer_core_mod.clean(item.genre)
 
         aggregate_score = best.score + max(0, (len(providers) - 1) * 25)
         aggregate_reason = best.reason if len(providers) == 1 else f"{best.reason}+consensus"
@@ -263,12 +273,12 @@ def aggregate_online_candidates(candidates: Iterable[OnlineCandidate]) -> list[R
                 sources=sources,
                 title=best.title,
                 authors=best.authors,
-                identifiers=identifiers,
+                identifiers=list(best.identifiers),
                 score=aggregate_score,
                 reason=aggregate_reason,
-                series=series,
-                volume=volume,
-                genre=genre,
+                series=infer_core_mod.clean_series(best.series),
+                volume=best.volume,
+                genre=infer_core_mod.clean(best.genre),
             )
         )
 
@@ -277,16 +287,39 @@ def aggregate_online_candidates(candidates: Iterable[OnlineCandidate]) -> list[R
 
 
 def pick_best_online_match(meta: EpubMetadata, candidates: Iterable[OnlineCandidate]) -> RankedOnlineMatch | None:
-    del meta
     aggregated = aggregate_online_candidates(candidates)
     if not aggregated:
         return None
+    aggregated.sort(
+        key=lambda item: candidate_scorer_mod.ranked_online_match_score(
+            meta,
+            item,
+            clean=infer_core_mod.clean,
+            normalize_match_text=infer_core_mod.normalize_match_text,
+            fold_text=infer_core_mod.fold_text,
+        ),
+        reverse=True,
+    )
     best = aggregated[0]
     if best.score < 140 and not best.title:
         return None
     if len(aggregated) > 1 and best.score < 420:
         second = aggregated[1]
-        if best.score - second.score < ONLINE_AMBIGUITY_MARGIN:
+        best_scored = candidate_scorer_mod.ranked_online_match_score(
+            meta,
+            best,
+            clean=infer_core_mod.clean,
+            normalize_match_text=infer_core_mod.normalize_match_text,
+            fold_text=infer_core_mod.fold_text,
+        )
+        second_scored = candidate_scorer_mod.ranked_online_match_score(
+            meta,
+            second,
+            clean=infer_core_mod.clean,
+            normalize_match_text=infer_core_mod.normalize_match_text,
+            fold_text=infer_core_mod.fold_text,
+        )
+        if best_scored - second_scored < ONLINE_AMBIGUITY_MARGIN:
             best = RankedOnlineMatch(
                 providers=best.providers,
                 sources=best.sources,
@@ -299,7 +332,17 @@ def pick_best_online_match(meta: EpubMetadata, candidates: Iterable[OnlineCandid
                 volume=best.volume,
                 genre=best.genre,
             )
-    if len(best.providers) == 1 and best.providers[0] == "lubimyczytac" and best.score < 420:
+    if (
+        len(best.providers) == 1
+        and best.providers[0] == "lubimyczytac"
+        and best.score < 420
+        and candidate_scorer_mod.should_penalize_single_lubimyczytac(
+            meta,
+            best,
+            clean=infer_core_mod.clean,
+            fold_text=infer_core_mod.fold_text,
+        )
+    ):
         best = RankedOnlineMatch(
             providers=best.providers,
             sources=best.sources,
@@ -323,9 +366,12 @@ def build_online_record(meta: EpubMetadata, best: RankedOnlineMatch, *, extract_
         review_reasons.append("online-niejednoznaczne")
     if "best-effort" in best.reason:
         review_reasons.append("online-best-effort")
+    author_text = extract_authors([], " & ".join(best.authors))
+    if "lubimyczytac" in best.providers:
+        author_text = extract_authors_preserving_order(best.authors)
     return BookRecord(
         path=meta.path,
-        author=extract_authors(best.authors, ""),
+        author=author_text,
         series=infer_core_mod.clean_series(best.series),
         volume=best.volume,
         title=best.title,
@@ -350,9 +396,22 @@ def parse_existing_filename(stem: str) -> tuple[str, str, tuple[int, str] | None
         value = infer_core_mod.clean(text)
         if not value or not re.search(r"[A-Za-z]", value):
             return False
+        words = value.split()
+        if len(words) == 1 and len(value) <= 2:
+            return False
+        if len(words) == 1 and value.lower() == value:
+            return False
         if re.match(r"^[#(\[]?\s*\d", value):
             return False
         if re.fullmatch(r"[IVXLCDM]+", value, flags=re.IGNORECASE):
+            return False
+        return True
+
+    def looks_like_existing_series(text: str, title_text: str) -> bool:
+        value = infer_core_mod.clean_series(text)
+        if not value:
+            return False
+        if looks_like_existing_author(value) and infer_core_mod.clean(title_text).startswith("["):
             return False
         return True
 
@@ -381,7 +440,7 @@ def parse_existing_filename(stem: str) -> tuple[str, str, tuple[int, str] | None
 
     author = infer_core_mod.clean(left)
     series = infer_core_mod.clean_series(last_segment)
-    if not author or not series or not looks_like_existing_author(author):
+    if not author or not series or not looks_like_existing_author(author) or not looks_like_existing_series(series, clean_title):
         return None
     return author, series, None, infer_core_mod.clean(clean_title), genre
 
@@ -441,6 +500,8 @@ def make_record_clone(
     review_reasons: list[str] | None = None,
     decision_reasons: list[str] | None = None,
     filename_suffix: str | None = None,
+    output_folder: Path | None = None,
+    archive_source_path: Path | None = None,
 ) -> BookRecord:
     return dataclasses.replace(
         record,
@@ -450,5 +511,7 @@ def make_record_clone(
         review_reasons=list(review_reasons) if review_reasons is not None else list(record.review_reasons),
         decision_reasons=list(decision_reasons) if decision_reasons is not None else list(record.decision_reasons),
         filename_suffix=record.filename_suffix if filename_suffix is None else filename_suffix,
+        output_folder=record.output_folder if output_folder is None else output_folder,
+        archive_source_path=record.archive_source_path if archive_source_path is None else archive_source_path,
         identifiers=list(record.identifiers),
     )

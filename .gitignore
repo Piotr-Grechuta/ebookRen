@@ -5,3 +5,5 @@ __pycache__/
 venv/
 *.csv
 online_cache*.json
+ebookren_processed.json
+*.zip

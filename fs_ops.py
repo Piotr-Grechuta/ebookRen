@@ -11,11 +11,23 @@ from typing import Any, Callable
 from models_core import RenameMove, UndoPlan
 
 
-def build_moves(records: list[Any], source_folder: Path, target_folder: Path, stamp: str) -> list[RenameMove]:
+def touch_destination_now(path: Path) -> None:
+    os.utime(path, None)
+
+
+def build_moves(
+    records: list[Any],
+    source_folder: Path,
+    target_folder: Path,
+    archive_folder: Path | None,
+    stamp: str,
+) -> list[RenameMove]:
     moves: list[RenameMove] = []
     same_folder = source_folder.resolve() == target_folder.resolve()
     for index, record in enumerate(records, start=1):
-        destination = target_folder / record.filename
+        record_target_folder = getattr(record, "output_folder", None)
+        destination_folder = record_target_folder if isinstance(record_target_folder, Path) else target_folder
+        destination = destination_folder / record.filename
         if record.path.parent.resolve() == destination.parent.resolve() and record.path.name == destination.name:
             continue
         if same_folder:
@@ -23,6 +35,11 @@ def build_moves(records: list[Any], source_folder: Path, target_folder: Path, st
             moves.append(RenameMove(record.path, temp, destination, record, "rename"))
         else:
             moves.append(RenameMove(record.path, None, destination, record, "copy"))
+            if archive_folder is not None:
+                archive_path = getattr(record, "archive_source_path", None)
+                if not isinstance(archive_path, Path):
+                    archive_path = archive_folder / record.path.name
+                moves.append(RenameMove(record.path, None, archive_path, record, "move"))
     return moves
 
 
@@ -60,24 +77,73 @@ def rollback_moves(moves: list[RenameMove], stage2_done: list[RenameMove]) -> No
             os.replace(move.temp, move.source)
 
 
+def rollback_executed_chunks(chunks: list[list[RenameMove]]) -> None:
+    for chunk in reversed(chunks):
+        if not chunk:
+            continue
+        operation = chunk[0].operation
+        if operation == "copy":
+            for move in reversed(chunk):
+                if move.destination.exists():
+                    move.destination.unlink()
+            continue
+        if operation == "move":
+            for move in reversed(chunk):
+                if move.destination.exists():
+                    move.source.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(move.destination), str(move.source))
+            continue
+        if operation == "delete":
+            for move in reversed(chunk):
+                if move.temp is not None and move.temp.exists():
+                    move.source.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(move.temp, move.source)
+                    move.temp.unlink()
+            continue
+        if operation == "rename":
+            for move in reversed(chunk):
+                if move.destination.exists():
+                    os.replace(move.destination, move.source)
+
+
 def execute_moves(moves: list[RenameMove]) -> list[str]:
     if not moves:
         return []
     operations = {move.operation for move in moves}
     if len(operations) > 1:
-        errors: list[str] = []
+        completed_chunks: list[list[RenameMove]] = []
         rename_like = [move for move in moves if move.operation == "rename"]
         copy_like = [move for move in moves if move.operation == "copy"]
+        move_like = [move for move in moves if move.operation == "move"]
         delete_like = [move for move in moves if move.operation == "delete"]
-        for chunk in (rename_like, copy_like, delete_like):
+        for chunk in (rename_like, copy_like, move_like, delete_like):
             if not chunk:
                 continue
-            errors.extend(execute_moves(chunk))
+            errors = execute_moves(chunk)
             if errors:
+                rollback_executed_chunks(completed_chunks)
                 return errors
+            completed_chunks.append(chunk)
         return []
 
     operation = next(iter(operations))
+    if operation == "move":
+        validation_errors = validate_move_collisions(moves)
+        if validation_errors:
+            return validation_errors
+        moved: list[RenameMove] = []
+        try:
+            for move in moves:
+                move.destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(move.source), str(move.destination))
+                moved.append(move)
+        except Exception as exc:
+            for item in reversed(moved):
+                if item.destination.exists():
+                    shutil.move(str(item.destination), str(item.source))
+            return [f"move:{move.source.name}: {exc}"]
+        return []
+
     if operation == "copy":
         validation_errors = validate_move_collisions(moves)
         if validation_errors:
@@ -87,6 +153,7 @@ def execute_moves(moves: list[RenameMove]) -> list[str]:
             for move in moves:
                 move.destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(move.source, move.destination)
+                touch_destination_now(move.destination)
                 created.append(move.destination)
         except Exception as exc:
             for path in reversed(created):
@@ -160,6 +227,7 @@ def execute_moves(moves: list[RenameMove]) -> list[str]:
     try:
         for move in moves:
             os.replace(move.temp, move.destination)
+            touch_destination_now(move.destination)
             stage2_done.append(move)
     except Exception as exc:
         errors.append(f"stage2:{move.source.name}: {exc}")
@@ -194,13 +262,28 @@ def build_undo_plan(report_path: Path, folder_hint: Path | None = None) -> UndoP
             source_folder = Path(row.get("source_folder") or folder)
             target_folder = Path(row.get("target_folder") or folder)
             operation = (row.get("operation") or "rename").strip().lower()
-            expected_status = "copied" if operation == "copy" else "renamed"
+            if operation == "copy":
+                expected_status = "copied"
+            elif operation == "move":
+                expected_status = "moved"
+            elif operation == "copy+archive":
+                expected_status = "copied+archived"
+            else:
+                expected_status = "renamed"
             if execution_status != expected_status:
                 continue
             current = target_folder / target_name
             destination = source_folder / source_name
             suffix = destination.suffix.lower() or current.suffix.lower() or ".tmp"
             if operation == "copy":
+                temp = target_folder / f"__tmp_undo_delete_{stamp}_{index:04d}{suffix}"
+                moves.append(RenameMove(current, temp, destination, None, "delete"))
+            elif operation == "copy+archive":
+                archive_source_name = row.get("archive_source_name") or ""
+                archive_source_folder = row.get("archive_source_folder") or ""
+                if archive_source_name and archive_source_folder:
+                    archived_current = Path(archive_source_folder) / archive_source_name
+                    moves.append(RenameMove(archived_current, None, destination, None, "move"))
                 temp = target_folder / f"__tmp_undo_delete_{stamp}_{index:04d}{suffix}"
                 moves.append(RenameMove(current, temp, destination, None, "delete"))
             else:

@@ -261,6 +261,18 @@ def split_authors(text: str, *, clean_author_segment) -> list[str]:
     if not text:
         return []
     text = re.sub(r"\[.*?\]", "", text)
+    shared_plural_match = re.fullmatch(
+        r"(?P<family>[^\s,;]+owie)\s+(?P<first>.+?)\s+i\s+(?P<second>.+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if shared_plural_match:
+        family_name = clean(shared_plural_match.group("family"))
+        shared_family = family_name[:-4] if family_name.lower().endswith("owie") and len(family_name) > 4 else family_name
+        first_author = clean(shared_plural_match.group("first"))
+        second_author = clean(shared_plural_match.group("second"))
+        if shared_family and first_author and second_author:
+            return [clean(f"{first_author} {shared_family}"), clean(f"{second_author} {shared_family}")]
     text = text.replace(";", " & ")
     text = re.sub(r"\s+(?:and|i)\s+", " & ", text, flags=re.IGNORECASE)
     if "&" not in text:

@@ -6,6 +6,9 @@ from typing import Callable
 
 
 Cleaner = Callable[[str | None], str]
+DOMAIN_ARTIFACT_RE = re.compile(
+    r"(?i)\b(?:https?://)?(?:www\.)?(?:[a-z0-9-]+\.){1,}[a-z]{2,}(?:/[^\s]*)?\b"
+)
 
 
 def is_publisher_like(text: str | None, *, clean: Cleaner, publisher_like_re) -> bool:
@@ -24,6 +27,8 @@ def strip_source_artifacts(
     if not value:
         return ""
     value = source_artifact_re.sub("", value)
+    if DOMAIN_ARTIFACT_RE.fullmatch(value):
+        value = ""
     value = hex_noise_re.sub("", value)
     value = re.sub(r"\s*\(\d+\)\s*$", "", value)
     return clean(value)
@@ -31,7 +36,14 @@ def strip_source_artifacts(
 
 def is_source_artifact(text: str | None, *, clean: Cleaner, source_artifact_re, nullish_re) -> bool:
     value = clean(text)
-    return bool(value and (source_artifact_re.search(value) or nullish_re.match(value)))
+    return bool(
+        value
+        and (
+            source_artifact_re.search(value)
+            or nullish_re.match(value)
+            or DOMAIN_ARTIFACT_RE.fullmatch(value)
+        )
+    )
 
 
 def looks_like_author_segment(
@@ -55,6 +67,7 @@ def clean_author_segment(text: str | None, *, strip_source_artifacts: Cleaner, c
     value = strip_source_artifacts(text)
     if not value:
         return ""
+    value = re.sub(r"^\s*[\[(]\d{1,4}[\])]\s*", "", value)
     value = re.sub(r"\s*[-,;]\s*\d+(?:\s*,\s*\d{4})?\s*$", "", value)
     value = re.sub(r"\s*,\s*\d{4}\s*$", "", value)
     return clean(value)
