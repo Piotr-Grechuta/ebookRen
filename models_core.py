@@ -63,6 +63,7 @@ class RankedOnlineMatch:
     series: str = ""
     volume: tuple[int, str] | None = None
     genre: str = ""
+    cycle_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class OnlineCandidate:
     series: str = ""
     volume: tuple[int, str] | None = None
     genre: str = ""
+    cycle_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class LubimyczytacResult:
     volume: tuple[int, str] | None = None
     url: str = ""
     genres: list[str] = field(default_factory=list)
+    cycle_source: str = ""
 
 
 @dataclass(frozen=True)

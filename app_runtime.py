@@ -11,6 +11,7 @@ import author_catalog as author_catalog_mod
 import cache_online as cache_online_mod
 import candidate_scorer as candidate_scorer_mod
 import domain_naming as domain_naming_mod
+import embedded_metadata as embedded_metadata_mod
 import infer_engine as infer_engine_mod
 import infer_flow as infer_flow_mod
 import infer_core as infer_core_mod
@@ -1065,6 +1066,103 @@ def read_book_metadata(path: Path) -> EpubMetadata:
     )
 
 
+def metadata_author_display_name(name: str) -> str:
+    normalized_name = clean_author_segment(name)
+    if not normalized_name:
+        return ""
+    resolved = clean_author_segment(resolve_known_author(normalized_name))
+    if resolved and normalize_match_text(to_last_first(resolved)) == normalize_match_text(normalized_name):
+        return resolved
+    words = normalized_name.split()
+    if len(words) < 2:
+        return normalized_name
+
+    particle_tokens = {
+        "al",
+        "bin",
+        "da",
+        "de",
+        "del",
+        "della",
+        "der",
+        "di",
+        "du",
+        "ibn",
+        "la",
+        "le",
+        "san",
+        "st",
+        "st.",
+        "van",
+        "von",
+    }
+    candidates: list[tuple[int, str]] = []
+    for cut in range(1, len(words)):
+        given_tokens = words[cut:]
+        if not given_tokens:
+            continue
+        if given_tokens[0].lower().rstrip(".") in particle_tokens:
+            continue
+        candidate = clean_author_segment(" ".join(given_tokens + words[:cut]))
+        if normalize_match_text(to_last_first(candidate)) != normalize_match_text(normalized_name):
+            continue
+        candidates.append((len(given_tokens), candidate))
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], len(item[1])))
+        return candidates[0][1]
+    return normalized_name
+
+
+def metadata_author_pairs(author_text: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for author in split_authors(author_text) or [author_text]:
+        sort_key = clean_author_segment(author)
+        if not sort_key:
+            continue
+        display_name = metadata_author_display_name(sort_key) or sort_key
+        pairs.append((display_name, sort_key))
+    return pairs or [("Nieznany Autor", "Nieznany Autor")]
+
+
+def write_book_metadata(path: Path, record: BookRecord, *, extra_tags: list[str] | None = None) -> None:
+    author_pairs = metadata_author_pairs(record.author)
+    creators = [display_name for display_name, _sort_key in author_pairs]
+    creator_sort_keys = [sort_key for _display_name, sort_key in author_pairs]
+    subjects = embedded_metadata_mod.build_subjects(
+        record.genre,
+        extra_tags or [],
+        clean=clean,
+        normalize_match_text=normalize_match_text,
+    )
+    if path.suffix.lower() == ".epub":
+        runtime_metadata_mod.write_epub_metadata(
+            path,
+            title=record.title,
+            creators=creators,
+            creator_sort_keys=creator_sort_keys,
+            series=record.series,
+            volume=record.volume,
+            genre=record.genre,
+            extra_subjects=subjects,
+            clean=clean,
+            clean_series=clean_series,
+            normalize_match_text=normalize_match_text,
+        )
+        return
+    embedded_metadata_mod.write_metadata_with_calibre(
+        path,
+        title=record.title,
+        creators=creators,
+        author_sort=" & ".join(creator_sort_keys),
+        series=record.series,
+        volume=record.volume,
+        subjects=subjects,
+        identifiers=list(record.identifiers),
+        clean=clean,
+        clean_series=clean_series,
+        normalize_match_text=normalize_match_text,
+    )
+
 
 def extract_authors(creators: list[str], segment_author: str) -> str:
     return infer_engine_mod.extract_authors(
@@ -1307,6 +1405,7 @@ def write_report(
     target_folder: Path,
     operation: str,
     execution_status: dict[Path, str] | None = None,
+    embedded_metadata_status: dict[Path, str] | None = None,
 ) -> None:
     job_runner_mod.write_report(
         path,
@@ -1317,6 +1416,7 @@ def write_report(
         operation,
         format_volume=format_volume,
         execution_status=execution_status,
+        embedded_metadata_status=embedded_metadata_status,
     )
 
 
@@ -1347,6 +1447,7 @@ def run_job(
     timeout: float,
     limit: int,
     online_workers: int = DEFAULT_INFER_WORKERS,
+    write_epub_metadata: bool = True,
     emit_progress: Callable[[str], None] | None = None,
     emit_trace: Callable[[str], None] | None = None,
     skip_previously_processed: bool = False,
@@ -1367,6 +1468,7 @@ def run_job(
         is_supported_book_file=is_supported_book_file,
         read_book_metadata=read_book_metadata,
         infer_record=infer_record,
+        write_book_metadata=write_book_metadata,
         build_moves=build_moves,
         execute_moves=execute_moves,
         format_volume=format_volume,
@@ -1374,6 +1476,7 @@ def run_job(
         set_output_folder_fn=set_output_folder,
         dedupe_destinations_fn=dedupe_destinations,
         flush_online_cache_if_needed=flush_online_cache_if_needed,
+        write_epub_metadata=write_epub_metadata,
         emit_progress=emit_progress,
         emit_trace=emit_trace,
         skip_previously_processed=skip_previously_processed,

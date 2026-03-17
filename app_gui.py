@@ -30,10 +30,12 @@ def load_gui_state() -> dict[str, str]:
         value = payload.get(key)
         if isinstance(value, str):
             state[key] = value
+    if isinstance(payload.get("write_epub_metadata"), bool):
+        state["write_epub_metadata"] = "true" if payload["write_epub_metadata"] else "false"
     return state
 
 
-def save_gui_state(*, source_folder: str, destination_folder: str, archive_folder: str, online_mode: str) -> None:
+def save_gui_state(*, source_folder: str, destination_folder: str, archive_folder: str, online_mode: str, write_epub_metadata: bool) -> None:
     path = gui_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -41,6 +43,7 @@ def save_gui_state(*, source_folder: str, destination_folder: str, archive_folde
         "destination_folder": destination_folder.strip(),
         "archive_folder": archive_folder.strip(),
         "online_mode": online_mode.strip().upper() or runtime.DEFAULT_ONLINE_MODE,
+        "write_epub_metadata": bool(write_epub_metadata),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -56,6 +59,7 @@ def launch_gui(
     default_online: bool,
     default_online_workers: int,
     default_skip_processed: bool,
+    default_write_epub_metadata: bool,
 ) -> int:
     saved_state = load_gui_state()
     root = tk.Tk()
@@ -75,6 +79,9 @@ def launch_gui(
     online_var = tk.BooleanVar(value=default_online)
     apply_var = tk.BooleanVar(value=False)
     skip_processed_var = tk.BooleanVar(value=default_skip_processed)
+    write_epub_metadata_var = tk.BooleanVar(
+        value=(saved_state.get("write_epub_metadata") or ("true" if default_write_epub_metadata else "false")).lower() == "true"
+    )
     status_var = tk.StringVar(value="Gotowe.")
 
     def persist_gui_state() -> None:
@@ -83,6 +90,7 @@ def launch_gui(
             destination_folder=destination_var.get(),
             archive_folder=archive_var.get(),
             online_mode=online_mode_var.get(),
+            write_epub_metadata=write_epub_metadata_var.get(),
         )
 
     def choose_folder() -> None:
@@ -187,6 +195,7 @@ def launch_gui(
         apply_changes = apply_var.get()
         use_online = online_var.get()
         skip_processed = skip_processed_var.get()
+        write_epub_metadata = write_epub_metadata_var.get()
         online_mode = online_mode_var.get().strip().upper() or runtime.DEFAULT_ONLINE_MODE
         persist_gui_state()
 
@@ -211,6 +220,7 @@ def launch_gui(
                         timeout=timeout,
                         limit=limit,
                         online_workers=online_workers,
+                        write_epub_metadata=write_epub_metadata,
                         emit_progress=lambda message: result_queue.put(("progress", message)),
                         emit_trace=lambda message: result_queue.put(("trace", message)),
                         skip_previously_processed=skip_processed,
@@ -254,16 +264,17 @@ def launch_gui(
     ttk.Checkbutton(options, text="Online", variable=online_var).grid(row=0, column=0, sticky="w")
     ttk.Checkbutton(options, text="Apply", variable=apply_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
     ttk.Checkbutton(options, text="Pomijaj przetworzone", variable=skip_processed_var).grid(row=0, column=2, sticky="w", padx=(12, 0))
-    ttk.Label(options, text="Tryb online").grid(row=0, column=3, sticky="w", padx=(20, 0))
-    ttk.Radiobutton(options, text="PL", value="PL", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=4, sticky="w")
-    ttk.Radiobutton(options, text="PL+", value="PL+", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=5, sticky="w")
-    ttk.Radiobutton(options, text="EN", value="EN", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=6, sticky="w")
-    ttk.Label(options, text="Timeout").grid(row=0, column=7, sticky="w", padx=(20, 0))
-    ttk.Entry(options, textvariable=timeout_var, width=8).grid(row=0, column=8, sticky="w")
-    ttk.Label(options, text="Limit").grid(row=0, column=9, sticky="w", padx=(20, 0))
-    ttk.Entry(options, textvariable=limit_var, width=8).grid(row=0, column=10, sticky="w")
-    ttk.Label(options, text="Infer workers").grid(row=0, column=11, sticky="w", padx=(20, 0))
-    ttk.Entry(options, textvariable=online_workers_var, width=8).grid(row=0, column=12, sticky="w")
+    ttk.Checkbutton(options, text="Zapisz metadane w pliku", variable=write_epub_metadata_var, command=persist_gui_state).grid(row=0, column=3, sticky="w", padx=(12, 0))
+    ttk.Label(options, text="Tryb online").grid(row=0, column=4, sticky="w", padx=(20, 0))
+    ttk.Radiobutton(options, text="PL", value="PL", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=5, sticky="w")
+    ttk.Radiobutton(options, text="PL+", value="PL+", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=6, sticky="w")
+    ttk.Radiobutton(options, text="EN", value="EN", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=7, sticky="w")
+    ttk.Label(options, text="Timeout").grid(row=0, column=8, sticky="w", padx=(20, 0))
+    ttk.Entry(options, textvariable=timeout_var, width=8).grid(row=0, column=9, sticky="w")
+    ttk.Label(options, text="Limit").grid(row=0, column=10, sticky="w", padx=(20, 0))
+    ttk.Entry(options, textvariable=limit_var, width=8).grid(row=0, column=11, sticky="w")
+    ttk.Label(options, text="Infer workers").grid(row=0, column=12, sticky="w", padx=(20, 0))
+    ttk.Entry(options, textvariable=online_workers_var, width=8).grid(row=0, column=13, sticky="w")
 
     run_button = ttk.Button(frame, text="Uruchom", command=run_from_gui)
     run_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0))

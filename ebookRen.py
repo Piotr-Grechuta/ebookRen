@@ -15,6 +15,7 @@ def main() -> int:
         False,
         runtime.DEFAULT_INFER_WORKERS,
         False,
+        True,
     )
 
 

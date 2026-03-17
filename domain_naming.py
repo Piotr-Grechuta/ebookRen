@@ -279,6 +279,7 @@ def aggregate_online_candidates(candidates: Iterable[OnlineCandidate]) -> list[R
                 series=infer_core_mod.clean_series(best.series),
                 volume=best.volume,
                 genre=infer_core_mod.clean(best.genre),
+                cycle_source=getattr(best, "cycle_source", ""),
             )
         )
 
@@ -331,6 +332,7 @@ def pick_best_online_match(meta: EpubMetadata, candidates: Iterable[OnlineCandid
                 series=best.series,
                 volume=best.volume,
                 genre=best.genre,
+                cycle_source=best.cycle_source,
             )
     if (
         len(best.providers) == 1
@@ -354,6 +356,7 @@ def pick_best_online_match(meta: EpubMetadata, candidates: Iterable[OnlineCandid
             series=best.series,
             volume=best.volume,
             genre=best.genre,
+            cycle_source=best.cycle_source,
         )
     return best
 
@@ -369,11 +372,17 @@ def build_online_record(meta: EpubMetadata, best: RankedOnlineMatch, *, extract_
     author_text = extract_authors([], " & ".join(best.authors))
     if "lubimyczytac" in best.providers:
         author_text = extract_authors_preserving_order(best.authors)
+    cycle_source = str(getattr(best, "cycle_source", "")).strip().lower()
+    authoritative_series = infer_core_mod.clean_series(best.series)
+    authoritative_volume = best.volume
+    if cycle_source == "search":
+        authoritative_series = ""
+        authoritative_volume = None
     return BookRecord(
         path=meta.path,
         author=author_text,
-        series=infer_core_mod.clean_series(best.series),
-        volume=best.volume,
+        series=authoritative_series,
+        volume=authoritative_volume,
         title=best.title,
         source=source_text or "online-aggregate",
         identifiers=best.identifiers,
@@ -392,8 +401,17 @@ def build_online_record(meta: EpubMetadata, best: RankedOnlineMatch, *, extract_
 
 
 def parse_existing_filename(stem: str) -> tuple[str, str, tuple[int, str] | None, str, str] | None:
-    def looks_like_existing_author(text: str) -> bool:
+    def normalize_existing_author(text: str, *, allow_leading_index: bool = False) -> str:
         value = infer_core_mod.clean(text)
+        if not value:
+            return ""
+        if not allow_leading_index:
+            return value
+        stripped = infer_core_mod.clean(re.sub(r"^\d{1,4}(?:[.)_-]+|\s+)+", "", value))
+        return stripped or value
+
+    def looks_like_existing_author(text: str, *, allow_leading_index: bool = False) -> bool:
+        value = normalize_existing_author(text, allow_leading_index=allow_leading_index)
         if not value or not re.search(r"[A-Za-z]", value):
             return False
         words = value.split()
@@ -415,6 +433,45 @@ def parse_existing_filename(stem: str) -> tuple[str, str, tuple[int, str] | None
             return False
         return True
 
+    def is_structural_placeholder(text: str) -> bool:
+        value = infer_core_mod.clean(text)
+        if not value:
+            return True
+        if infer_core_mod.normalize_match_text(value) == infer_core_mod.normalize_match_text("Standalone"):
+            return True
+        if re.fullmatch(r"(?:\d+(?:\.\d+)?|[IVXLCDM]+)", value, flags=re.IGNORECASE):
+            return True
+        tokens = [infer_core_mod.normalize_match_text(token) for token in value.split() if infer_core_mod.normalize_match_text(token)]
+        if not tokens:
+            return True
+        allowed_tokens = {"book", "cykl", "czesc", "ksiega", "part", "standalone", "tom", "vol", "volume"}
+        return all(token in allowed_tokens or token.isdigit() for token in tokens)
+
+    def split_embedded_series_volume_title(text: str) -> tuple[str, tuple[int, str], str] | None:
+        value = infer_core_mod.clean(text)
+        if not value:
+            return None
+        match = re.match(
+            r"^(?P<series>.+?)\s*\(\s*(?:(?:book|tom|volume|vol\.?|czesc|część|ksiega|księga)\s*)?(?P<volume>\d+(?:\.\d+)?|[IVXLCDM]+)\s*\)\s*(?:[-:._]\s*)?(?P<title>.+)$",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        series = infer_core_mod.clean_series(match.group("series"))
+        volume = infer_core_mod.parse_volume_parts(match.group("volume"))
+        title = infer_core_mod.clean(match.group("title"))
+        if (
+            not series
+            or volume is None
+            or not title
+            or len(series.split()) < 2
+            or is_structural_placeholder(series)
+            or is_structural_placeholder(title)
+        ):
+            return None
+        return series, volume, title
+
     prefix, sep, title = stem.rpartition(" - ")
     if not sep or not title:
         return None
@@ -428,19 +485,75 @@ def parse_existing_filename(stem: str) -> tuple[str, str, tuple[int, str] | None
         if volume is None:
             return None
         author_part, sep, series_part = left.rpartition(" - ")
+        normalized_series = infer_core_mod.clean_series(series_part) if series_part else ""
+        allow_prefixed_author_index = bool(normalized_series and normalized_series != "Standalone")
+        selected_title = infer_core_mod.clean(clean_title)
         if sep and author_part and series_part:
-            author = infer_core_mod.clean(author_part)
-            series = infer_core_mod.clean_series(series_part)
+            author = normalize_existing_author(author_part, allow_leading_index=allow_prefixed_author_index)
+            series = normalized_series
+            legacy_title_part, legacy_sep, legacy_author_part = author_part.rpartition(" - ")
+            normalized_legacy_author = normalize_existing_author(legacy_author_part, allow_leading_index=allow_prefixed_author_index)
+            legacy_title = infer_core_mod.clean(legacy_title_part)
+            if (
+                legacy_sep
+                and legacy_title
+                and normalized_legacy_author
+                and looks_like_existing_author(normalized_legacy_author, allow_leading_index=allow_prefixed_author_index)
+            ):
+                selected_title_key = infer_core_mod.normalize_match_text(selected_title)
+                series_key = infer_core_mod.normalize_match_text(series)
+                if (
+                    len(selected_title.split()) == 1
+                    and len(normalized_legacy_author.split()) == 1
+                    and re.search(r"[A-Za-z]", selected_title)
+                ):
+                    repaired_legacy_title = legacy_title
+                    if " & " in repaired_legacy_title:
+                        left_title, _, right_title = repaired_legacy_title.rpartition(" & ")
+                        if infer_core_mod.clean(right_title) and len(infer_core_mod.clean(right_title).split()) == 1:
+                            repaired_legacy_title = infer_core_mod.clean(left_title) or repaired_legacy_title
+                    author = infer_core_mod.clean(f"{selected_title} {normalized_legacy_author}")
+                    selected_title = repaired_legacy_title
+                elif (
+                    not selected_title
+                    or is_structural_placeholder(selected_title)
+                    or selected_title_key == series_key
+                    or len(selected_title.split()) < 2 <= len(legacy_title.split())
+                ):
+                    author = normalized_legacy_author
+                    selected_title = legacy_title
         else:
-            author = infer_core_mod.clean(left)
+            author = normalize_existing_author(left)
             series = ""
-        if not author or not looks_like_existing_author(author):
+        if (not series or series == "Standalone") and volume == (0, "00"):
+            embedded_series = split_embedded_series_volume_title(selected_title)
+            if embedded_series is not None:
+                series, volume, selected_title = embedded_series
+        if not author or not looks_like_existing_author(author, allow_leading_index=allow_prefixed_author_index):
             return None
-        return author, series, volume, infer_core_mod.clean(clean_title), genre
+        if is_structural_placeholder(selected_title) or (series and series != "Standalone" and is_structural_placeholder(series)):
+            return None
+        return author, series, volume, selected_title, genre
 
-    author = infer_core_mod.clean(left)
+    author = normalize_existing_author(left)
     series = infer_core_mod.clean_series(last_segment)
-    if not author or not series or not looks_like_existing_author(author) or not looks_like_existing_series(series, clean_title):
+    normalized_title = infer_core_mod.normalize_match_text(clean_title)
+    if (
+        author
+        and looks_like_existing_author(author)
+        and normalized_title == infer_core_mod.normalize_match_text("Standalone")
+        and infer_core_mod.clean(last_segment)
+        and infer_core_mod.normalize_match_text(last_segment) != infer_core_mod.normalize_match_text("Standalone")
+    ):
+        return author, "Standalone", None, infer_core_mod.clean(last_segment), genre
+    if (
+        not author
+        or not series
+        or not looks_like_existing_author(author)
+        or not looks_like_existing_series(series, clean_title)
+        or is_structural_placeholder(series)
+        or is_structural_placeholder(clean_title)
+    ):
         return None
     return author, series, None, infer_core_mod.clean(clean_title), genre
 

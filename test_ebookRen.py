@@ -183,6 +183,24 @@ class KodV3Tests(unittest.TestCase):
             "Past's Price",
         )
 
+    def test_sanitize_title_repairs_rotated_last_word_with_trailing_preposition(self) -> None:
+        self.assertEqual(
+            kod_v3.sanitize_title("Bagdadzie Spotkanie w", "Standalone", None),
+            "Spotkanie w Bagdadzie",
+        )
+
+    def test_sanitize_title_repairs_rotated_last_word_with_styles_pattern(self) -> None:
+        self.assertEqual(
+            kod_v3.sanitize_title("Styles Tajemnicza historia w", "Standalone", None),
+            "Tajemnicza historia w Styles",
+        )
+
+    def test_sanitize_title_repairs_front_loaded_tail_word(self) -> None:
+        self.assertEqual(
+            kod_v3.sanitize_title("litosci Nie ma", "Standalone", None),
+            "Nie ma litosci",
+        )
+
     def test_unicode_normalization_keeps_polish_matching_signal(self) -> None:
         self.assertEqual(kod_v3.normalize_match_text("Żmijewski"), "zmijewski")
         self.assertEqual(kod_v3.author_key("Łukasz Żmijewski"), "lukaszzmijewski")
@@ -374,6 +392,15 @@ class KodV3Tests(unittest.TestCase):
             (2, "00"),
         )
         self.assertEqual(value, "Pigulki namietnosci")
+
+    def test_sanitize_title_for_online_query_strips_leading_series_with_parenthesized_index(self) -> None:
+        value = kod_v3.sanitize_title_for_online_query(
+            "Nowe przygody trzech detektywow (05) Powrot z piekla",
+            "Hitchcock Alfred",
+            "Standalone",
+            (0, "00"),
+        )
+        self.assertEqual(value, "Powrot z piekla")
 
     def test_build_online_query_variants_uses_author_embedded_in_title(self) -> None:
         meta = make_meta("x")
@@ -703,6 +730,18 @@ class KodV3Tests(unittest.TestCase):
             "Przewodnik www.example.com dla kazdego",
         )
 
+    def test_strip_source_artifacts_removes_trailing_rename_placeholders(self) -> None:
+        self.assertEqual(
+            kod_v3.strip_source_artifacts("Styles W - Agatha Christi - Styles Tajemnicza historia w - Standalone - Tom - Tom 00.00 - Tom 00.00"),
+            "Styles W - Agatha Christi - Styles Tajemnicza historia w",
+        )
+
+    def test_strip_source_artifacts_removes_noise_prefix_before_ampersand_author(self) -> None:
+        self.assertEqual(
+            kod_v3.strip_source_artifacts("-376-377-000z-000z-000z & Kava Alex - Standalone - Tom 00.00 - Fałszywy krok"),
+            "Kava Alex - Standalone - Tom 00.00 - Fałszywy krok",
+        )
+
     def test_infer_record_does_not_keep_plain_author_name_as_fallback_title(self) -> None:
         meta = make_meta("Alexandra Adornetto")
 
@@ -906,6 +945,28 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.series, "The Black Mage")
         self.assertEqual(record.volume, (1, "00"))
 
+    def test_existing_format_with_parenthesized_index_in_title_accepts_lubimyczytac_volume_truth(self) -> None:
+        meta = make_meta("Hitchcock Alfred - Standalone - Tom 00.00 - Nowe przygody trzech detektywow (04) -Jak w komiksie")
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac:https://lubimyczytac.pl/ksiazka/48436/jak-w-komiksie",
+                "Jak w komiksie",
+                ["William McCay", "Alfred Hitchcock"],
+                [],
+                320,
+                "title-author-exact",
+                series="Nowe przygody trzech detektywow",
+                volume=(4, "00"),
+            )
+        ]
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0)
+        self.assertEqual(record.author, "McCay William & Hitchcock Alfred")
+        self.assertEqual(record.series, "Nowe przygody trzech detektywow")
+        self.assertEqual(record.volume, (4, "00"))
+        self.assertEqual(record.title, "Jak w komiksie")
+
     def test_existing_format_preserves_genre_suffix_from_input_filename_until_verified(self) -> None:
         meta = make_meta("Wisniewski-Snerg Adam - Standalone - Tom 00.00 - Nagi cel [fantasy]")
         record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
@@ -1092,13 +1153,171 @@ class KodV3Tests(unittest.TestCase):
         parsed = kod_v3.parse_existing_filename("Author - Series - Tom 01.00 - Title [fantasy]")
         self.assertEqual(parsed, ("Author", "Series", (1, "00"), "Title", "fantasy"))
 
+    def test_parse_existing_filename_accepts_leading_numeric_prefix_before_author(self) -> None:
+        parsed = kod_v3.parse_existing_filename("1  Ake Holmberg - Ture Sventon - Tom 01.00 - Latajacy detektyw")
+        self.assertEqual(parsed, ("Ake Holmberg", "Ture Sventon", (1, "00"), "Latajacy detektyw", ""))
+
+    def test_infer_record_treats_compact_known_author_core_as_author_only(self) -> None:
+        meta = make_meta("Abagnale Frank W")
+
+        with mock.patch.object(
+            kod_v3,
+            "resolve_known_author",
+            side_effect=lambda text: "Frank W Abagnale" if kod_v3.author_key(text or "") == kod_v3.author_key("Abagnale Frank W") else "",
+        ), mock.patch.object(
+            kod_v3,
+            "resolve_author_segment",
+            side_effect=lambda text: ["Frank W Abagnale"] if kod_v3.author_key(text or "") == kod_v3.author_key("Abagnale Frank W") else [],
+        ):
+            record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Abagnale Frank W")
+        self.assertEqual(record.title, "Bez tytulu")
+        self.assertEqual(record.filename, "Abagnale Frank W - Standalone - Tom 00.00 - Bez tytulu.epub")
+
+    def test_infer_record_recovers_existing_format_unknown_author_from_title(self) -> None:
+        meta = make_meta("Nieznany Autor - Standalone - Tom 00.00 - Abagnale Frank W")
+
+        with mock.patch.object(
+            kod_v3,
+            "resolve_author_segment",
+            side_effect=lambda text: ["Frank W Abagnale"] if kod_v3.author_key(text or "") == kod_v3.author_key("Abagnale Frank W") else [],
+        ):
+            record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Frank W Abagnale")
+        self.assertEqual(record.title, "Bez tytulu")
+        self.assertEqual(record.filename, "Frank W Abagnale - Standalone - Tom 00.00 - Bez tytulu.epub")
+
     def test_parse_existing_filename_rejects_parenthesized_index_prefix_as_author(self) -> None:
         parsed = kod_v3.parse_existing_filename("(03) - Burzowe Kocie - Maja Lidia Kossakowska")
         self.assertIsNone(parsed)
 
+    def test_parse_existing_filename_reinterprets_legacy_author_title_standalone_order(self) -> None:
+        parsed = kod_v3.parse_existing_filename("Christie Agatha - Poirota Wczesne sprawy - Standalone")
+        self.assertEqual(parsed, ("Christie Agatha", "Standalone", None, "Poirota Wczesne sprawy", ""))
+
+    def test_parse_existing_filename_recovers_author_from_legacy_title_author_series_volume_title(self) -> None:
+        parsed = kod_v3.parse_existing_filename("wojna Jutro - Aleksander Zoricz - Jutro wojna - Tom 01.00 - Jutro wojna")
+        self.assertEqual(parsed, ("Aleksander Zoricz", "Jutro wojna", (1, "00"), "wojna Jutro", ""))
+
+    def test_parse_existing_filename_extracts_embedded_series_and_volume_from_standalone_title(self) -> None:
+        parsed = kod_v3.parse_existing_filename(
+            "Hitchcock Alfred - Standalone - Tom 00.00 - Nowe przygody trzech detektywow (04) -Jak w komiksie"
+        )
+        self.assertEqual(
+            parsed,
+            (
+                "Hitchcock Alfred",
+                "Nowe przygody trzech detektywow",
+                (4, "00"),
+                "Jak w komiksie",
+                "",
+            ),
+        )
+
+    def test_parse_existing_filename_rejects_structural_placeholder_series_and_title(self) -> None:
+        parsed = kod_v3.parse_existing_filename(
+            "Styles W - Agatha Christi - Styles Tajemnicza historia w - Standalone - Tom - Tom 00.00 - Tom 00.00"
+        )
+        self.assertIsNone(parsed)
+
+    def test_build_online_query_variants_uses_longest_non_structural_chunk_from_malformed_core(self) -> None:
+        meta = kod_v3.EpubMetadata(
+            path=Path("x.epub"),
+            stem="Styles W - Agatha Christi - Styles Tajemnicza historia w - Standalone - Tom - Tom 00.00 - Tom 00.00",
+            segments=["Styles W - Agatha Christi - Styles Tajemnicza historia w"],
+            core="Styles W - Agatha Christi - Styles Tajemnicza historia w",
+        )
+        prototype = kod_v3.LocalPrototype(
+            path=Path("x.epub"),
+            author="w Styles Tajemnicza historia",
+            series="Standalone",
+            volume=None,
+            title="Agatha Christi",
+            genre="",
+            source="fallback",
+            confidence=45,
+            title_from_core=True,
+        )
+
+        variants = kod_v3.build_online_query_variants(meta, prototype)
+
+        self.assertTrue(any(item.title == "Tajemnicza historia w Styles" for item in variants))
+
     def test_parse_existing_filename_rejects_short_lowercase_author_prefix(self) -> None:
         parsed = kod_v3.parse_existing_filename("ja - Aksjonow Wasilij - [Moskiewska saga 3] Wiezienie i pokoj")
         self.assertIsNone(parsed)
+
+    def test_infer_record_repairs_legacy_title_author_series_volume_title_case(self) -> None:
+        meta = make_meta("wojna Jutro - Aleksander Zoricz - Jutro wojna - Tom 01.00 - Jutro wojna")
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Aleksander Zoricz")
+        self.assertEqual(record.series, "Jutro wojna")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.title, "Jutro wojna")
+        self.assertEqual(
+            record.filename,
+            "Aleksander Zoricz - Jutro wojna - Tom 01.00 - Jutro wojna.epub",
+        )
+
+    def test_infer_record_repairs_front_loaded_title_from_legacy_existing_format(self) -> None:
+        meta = make_meta("litosci Nie ma - Aleksander Zoricz - Jutro wojna - Tom 02.00 - Nie")
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Aleksander Zoricz")
+        self.assertEqual(record.series, "Jutro wojna")
+        self.assertEqual(record.volume, (2, "00"))
+        self.assertEqual(record.title, "Nie ma litosci")
+        self.assertEqual(
+            record.filename,
+            "Aleksander Zoricz - Jutro wojna - Tom 02.00 - Nie ma litosci.epub",
+        )
+
+    def test_infer_record_repairs_split_surname_and_given_name_in_legacy_existing_format(self) -> None:
+        meta = make_meta("wojna Jutro - Zoricz - Jutro wojna - Tom 01.00 - Aleksander")
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Aleksander Zoricz")
+        self.assertEqual(record.series, "Jutro wojna")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.title, "Jutro wojna")
+        self.assertEqual(
+            record.filename,
+            "Aleksander Zoricz - Jutro wojna - Tom 01.00 - Jutro wojna.epub",
+        )
+
+    def test_infer_record_strips_noise_prefix_before_known_author(self) -> None:
+        meta = make_meta("-376-377-000z-000z-000z & Kava Alex - Standalone - Tom 00.00 - Fałszywy krok [kryminał, sensacja, thriller]")
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Kava Alex")
+        self.assertEqual(record.series, "Standalone")
+        self.assertEqual(record.volume, (0, "00"))
+        self.assertEqual(record.title, "Fałszywy krok")
+        self.assertEqual(
+            record.filename,
+            "Kava Alex - Standalone - Tom 00.00 - Fałszywy krok [kryminał, sensacja, thriller].epub",
+        )
+
+    def test_infer_record_strips_known_noise_prefix_from_existing_format_author(self) -> None:
+        meta = make_meta("known U N & Wojt Albert - Kryminał z myszką - Tom 28.00 - Prawdziwy mężczyzna [kryminał, sensacja, thriller]")
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Wojt Albert")
+        self.assertEqual(record.series, "Kryminał z myszką")
+        self.assertEqual(record.volume, (28, "00"))
+        self.assertEqual(record.title, "Prawdziwy mężczyzna")
+        self.assertEqual(
+            record.filename,
+            "Wojt Albert - Kryminał z myszką - Tom 28.00 - Prawdziwy mężczyzna [kryminał, sensacja, thriller].epub",
+        )
 
     def test_infer_record_handles_parenthesized_index_title_author_pattern(self) -> None:
         meta = make_meta(
@@ -1112,6 +1331,36 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(
             record.filename,
             "Kossakowska Maja Lidia - Standalone - Tom 00.00 - Burzowe Kocie [fantasy].epub",
+        )
+
+    def test_infer_record_extracts_embedded_series_and_volume_from_existing_standalone_title(self) -> None:
+        meta = make_meta(
+            "Hitchcock Alfred - Standalone - Tom 00.00 - Przygody trzech detektywow (03) Tajemnica srebrnego pajaka"
+        )
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Hitchcock Alfred")
+        self.assertEqual(record.series, "Przygody trzech detektywow")
+        self.assertEqual(record.volume, (3, "00"))
+        self.assertEqual(record.title, "Tajemnica srebrnego pajaka")
+        self.assertEqual(
+            record.filename,
+            "Hitchcock Alfred - Przygody trzech detektywow - Tom 03.00 - Tajemnica srebrnego pajaka.epub",
+        )
+
+    def test_infer_record_recognizes_existing_format_with_leading_numeric_prefix(self) -> None:
+        meta = make_meta("1  Ake Holmberg - Ture Sventon - Tom 01.00 - Latajacy detektyw")
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.author, "Ake Holmberg")
+        self.assertEqual(record.series, "Ture Sventon")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.title, "Latajacy detektyw")
+        self.assertEqual(
+            record.filename,
+            "Ake Holmberg - Ture Sventon - Tom 01.00 - Latajacy detektyw.epub",
         )
 
     def test_infer_record_does_not_treat_short_lowercase_prefix_as_existing_format(self) -> None:
@@ -1446,6 +1695,62 @@ class KodV3Tests(unittest.TestCase):
 
         self.assertEqual(record.author, "Centkiewicz Czesław & Centkiewicz Alina")
 
+    def test_build_online_record_ignores_search_only_lubimyczytac_cycle_hint(self) -> None:
+        meta = make_meta("Reporter")
+        best = kod_v3.RankedOnlineMatch(
+            ["lubimyczytac"],
+            ["lubimyczytac"],
+            "Reporter",
+            ["A. J. Quinnell"],
+            [],
+            320,
+            "title-author-exact",
+            series="Czarna",
+            volume=(8, "00"),
+            genre="kryminaÄąâ€š, sensacja, thriller",
+            cycle_source="search",
+        )
+
+        record = kod_v3.build_online_record(meta, best)
+
+        self.assertEqual(record.series, "")
+        self.assertIsNone(record.volume)
+
+    def test_pl_lubimyczytac_truth_resets_search_only_cycle_hint_to_standalone(self) -> None:
+        meta = make_meta(
+            "A.J. Quinnell - Standalone - Tom 08.00 - Reporter",
+            creators=["A. J. Quinnell"],
+        )
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac:https://lubimyczytac.pl/ksiazka/101091/reporter",
+                "Reporter",
+                ["A. J. Quinnell"],
+                [],
+                320,
+                "title-author-exact",
+                series="Czarna",
+                volume=(8, "00"),
+                genre="kryminaÄąâ€š, sensacja, thriller",
+                cycle_source="search",
+            )
+        ]
+
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0, online_mode="PL")
+
+        self.assertEqual(record.author, "Quinnell A. J.")
+        self.assertEqual(record.title, "Reporter")
+        self.assertEqual(record.series, "Standalone")
+        self.assertIsNone(record.volume)
+        self.assertEqual(record.genre, "kryminaÄąâ€š, sensacja, thriller")
+        self.assertIn("online-truth:lubimyczytac", record.decision_reasons)
+        self.assertEqual(
+            record.filename,
+            "Quinnell A. J - Standalone - Tom 00.00 - Reporter [kryminaÄąâ€š, sensacja, thriller].epub",
+        )
+
     def test_lubimyczytac_html_parser_extracts_title_and_author(self) -> None:
         parser = kod_v3.LubimyczytacSearchParser()
         parser.feed(
@@ -1456,7 +1761,7 @@ class KodV3Tests(unittest.TestCase):
         parser.close()
         self.assertEqual(
             parser.results,
-            [kod_v3.LubimyczytacResult("Bibliomancer", ["James Hunter"], "Wolfman Warlock", (1, "00"), "/x")],
+            [kod_v3.LubimyczytacResult("Bibliomancer", ["James Hunter"], "Wolfman Warlock", (1, "00"), "/x", cycle_source="search")],
         )
 
     def test_parse_lubimyczytac_detail_page_extracts_cycle_and_genre(self) -> None:

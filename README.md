@@ -10,6 +10,9 @@ Windows-focused ebook renamer/copy-archiver with GUI and optional online metadat
 - GUI only
 - Preview, apply, destination-copy mode, archive-originals mode, and undo from CSV log exported by GUI
 - Optional online enrichment from public catalog providers
+- Optional embedded metadata writing during `Apply`
+  - `epub`: native in-file update
+  - other writable formats: via calibre `ebook-meta` when available
 - Direct embedded metadata parsing is currently implemented for `epub`; other supported extensions rely on filename heuristics and optional online lookup
 
 ## Filename pattern
@@ -25,6 +28,7 @@ When the tool can infer a broad genre from EPUB subjects or online catalog metad
 ## Format support
 
 - `epub`: reads embedded metadata (`title`, `creator`, `identifier`, `subject`, selected series fields)
+- `epub`: can also write embedded metadata on `Apply` for easier import into Calibre
 - `mobi`, `azw`, `azw3`, `pdf`, `lit`, `fb2`, `rtf`, `txt`: currently normalized from filename parsing plus optional online enrichment
 
 ## Requirements
@@ -44,4 +48,10 @@ Uruchomienie:
 
 ```powershell
 python ebookRen.py
+```
+
+Hurtowe uzupelnienie metadanych juz przemianowanych plikow:
+
+```powershell
+python backfill_embedded_metadata.py D:\Sciezka\Do\Biblioteki --recursive --apply --killim
 ```

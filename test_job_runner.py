@@ -207,6 +207,45 @@ class JobRunnerTests(unittest.TestCase):
 
             self.assertEqual(records[0].archive_source_path, archive_folder / "source (1).epub")
 
+    def test_run_job_writes_embedded_metadata_for_unchanged_epub_on_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "source.epub"
+            source.write_text("x", encoding="utf-8")
+            metadata_calls: list[tuple[Path, str]] = []
+
+            code, lines = job_runner.run_job(
+                folder,
+                destination_folder=None,
+                archive_folder=None,
+                online_mode="PL",
+                apply_changes=True,
+                use_online=False,
+                providers=[],
+                timeout=1.0,
+                limit=0,
+                online_workers=1,
+                default_infer_workers=1,
+                online_http_slots=4,
+                is_supported_book_file=lambda path: path.suffix == ".epub",
+                read_book_metadata=lambda path: object(),
+                infer_record=lambda meta, **kwargs: DummyRecord(path=source, filename="source.epub"),
+                write_book_metadata=lambda path, record: metadata_calls.append((path, record.filename)),
+                build_moves=lambda records, source_folder, target_folder, archive_folder, stamp: [],
+                execute_moves=lambda moves: [],
+                format_volume=lambda volume: "Tom 01.00",
+                write_report_fn=lambda *args, **kwargs: None,
+                set_output_folder_fn=lambda records, folder: records,
+                dedupe_destinations_fn=lambda records, folder: records,
+                flush_online_cache_if_needed=lambda force=False: None,
+                write_epub_metadata=True,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(metadata_calls, [(source, "source.epub")])
+            self.assertIn("EMBEDDED_METADATA=ON", lines)
+            self.assertIn("EMBEDDED_METADATA_WRITTEN=1", lines)
+
 
 if __name__ == "__main__":
     unittest.main()

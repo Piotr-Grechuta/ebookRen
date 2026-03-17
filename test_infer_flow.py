@@ -3,7 +3,7 @@ import unittest
 
 import infer_flow
 from domain_naming import BookRecord
-from models_core import EpubMetadata, OnlineCandidate, OnlineVerification
+from models_core import Candidate, EpubMetadata, OnlineCandidate, OnlineVerification
 
 
 class InferFlowTests(unittest.TestCase):
@@ -191,6 +191,31 @@ class InferFlowTests(unittest.TestCase):
         )
 
         self.assertEqual(record.genre, "thriller")
+
+    def test_collect_online_candidate_candidates_ignores_search_only_cycle_hint(self) -> None:
+        candidate = OnlineCandidate(
+            provider="lubimyczytac",
+            source="lubimyczytac",
+            title="Reporter",
+            authors=["A. J. Quinnell"],
+            identifiers=[],
+            score=320,
+            reason="title-author-exact",
+            series="Czarna",
+            volume=(8, "00"),
+            cycle_source="search",
+        )
+
+        parsed = infer_flow.collect_online_candidate_candidates(
+            candidate,
+            add_candidate=lambda bucket, series, volume, score, source, title_override=None: bucket.append(
+                Candidate(score, series, volume, title_override, source)
+            ),
+            collect_title_candidates=lambda title, bucket: None,
+            collect_core_candidates=lambda title, bucket: None,
+        )
+
+        self.assertEqual(parsed, [])
 
 
 if __name__ == "__main__":

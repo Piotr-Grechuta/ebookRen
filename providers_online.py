@@ -119,6 +119,7 @@ class LubimyczytacSearchParserBase(HTMLParser):
                     series=self._series,
                     volume=self._volume,
                     url=self._title_href,
+                    cycle_source="search" if self._series or self._volume is not None else "",
                 )
             )
         self._title_parts = []
@@ -210,6 +211,7 @@ def enrich_lubimyczytac_result(
     if not page:
         return result
     series, volume, genres = parse_detail_page(page)
+    cycle_source = "detail" if series or volume is not None else getattr(result, "cycle_source", "")
     return result_type(
         title=result.title,
         authors=list(result.authors),
@@ -217,6 +219,7 @@ def enrich_lubimyczytac_result(
         volume=volume or result.volume,
         url=result.url,
         genres=genres or list(result.genres),
+        cycle_source=cycle_source,
     )
 
 
@@ -470,6 +473,7 @@ def lubimyczytac_candidates(
                     series=clean_series(result.series),
                     volume=result.volume,
                     genre=resolve_lubimyczytac_genre(list(result.genres)),
+                    cycle_source=getattr(result, "cycle_source", ""),
                 )
             )
 

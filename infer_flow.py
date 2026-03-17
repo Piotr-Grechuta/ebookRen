@@ -205,6 +205,14 @@ def is_strong_online_candidate(candidate: object, *, is_online_candidate, clean_
     )
 
 
+def online_candidate_cycle_is_authoritative(candidate: object, *, clean_series: Callable[[str | None], str]) -> bool:
+    series = clean_series(getattr(candidate, "series", ""))
+    volume = getattr(candidate, "volume", None)
+    if not series and volume is None:
+        return False
+    return str(getattr(candidate, "cycle_source", "")).strip().lower() != "search"
+
+
 def register_online_role_text(
     bucket: dict[str, str],
     text: str | None,
@@ -231,7 +239,7 @@ def collect_online_candidate_candidates(
     collect_core_candidates,
 ) -> list[Candidate]:
     parsed_candidates: list[Candidate] = []
-    if candidate.series:
+    if online_candidate_cycle_is_authoritative(candidate, clean_series=lambda text: text or "") and candidate.series:
         add_candidate(
             parsed_candidates,
             candidate.series,
@@ -474,9 +482,25 @@ def verify_record_against_online(
             if candidate_supports_context and not volume_confirmed and record_volume_known and parsed.volume == record.volume:
                 volume_confirmed = True
 
-        if candidate_supports_context and not series_confirmed and record_series_key and normalize_match_text(online_candidate.series) == record_series_key:
+        candidate_cycle_is_authoritative = online_candidate_cycle_is_authoritative(
+            online_candidate,
+            clean_series=lambda text: text or "",
+        )
+        if (
+            candidate_supports_context
+            and candidate_cycle_is_authoritative
+            and not series_confirmed
+            and record_series_key
+            and normalize_match_text(online_candidate.series) == record_series_key
+        ):
             series_confirmed = True
-        if candidate_supports_context and not volume_confirmed and record_volume_known and online_candidate.volume == record.volume:
+        if (
+            candidate_supports_context
+            and candidate_cycle_is_authoritative
+            and not volume_confirmed
+            and record_volume_known
+            and online_candidate.volume == record.volume
+        ):
             volume_confirmed = True
         if author_confirmed and title_confirmed and series_confirmed and volume_confirmed:
             break
@@ -616,7 +640,9 @@ def validate_record_components_with_online(
                 (
                     candidate
                     for candidate in sorted(supporting_online_candidates, key=lambda item: item.score, reverse=True)
-                    if is_strong_online_candidate(candidate) and clean_series(candidate.series)
+                    if is_strong_online_candidate(candidate)
+                    and online_candidate_cycle_is_authoritative(candidate, clean_series=clean_series)
+                    and clean_series(candidate.series)
                 ),
                 None,
             )
@@ -798,6 +824,11 @@ def infer_record(
     inference_meta = meta
     inference_meta_notes: list[str] = []
 
+    def author_token_signature(value: str | None) -> tuple[str, ...]:
+        cleaned_value = clean_author_segment(value)
+        tokens = [normalize_match_text(token) for token in cleaned_value.split() if normalize_match_text(token)]
+        return tuple(sorted(tokens))
+
     def trace_state(label: str, current_record=None, extra: list[str] | None = None) -> None:
         if emit_trace is None:
             return
@@ -851,12 +882,33 @@ def infer_record(
     )
 
     existing = parse_existing_filename(meta.stem)
+    if clean(inference_meta.core) and clean(inference_meta.core) != clean(meta.stem):
+        cleaned_existing = parse_existing_filename(inference_meta.core)
+        if cleaned_existing is not None:
+            existing = cleaned_existing
     candidates: list[Candidate] = []
     author_from_trailing_core = False
     title_from_core = False
     local_prototype: LocalPrototype | None = None
     if existing is not None:
         author, series, volume, title, genre = existing
+        recovered_existing_author_from_title = False
+        cleaned_existing_author = clean_author_segment(author)
+        if cleaned_existing_author:
+            author = cleaned_existing_author
+        if author == "Nieznany Autor":
+            title_candidate = clean(title)
+            resolved_title_authors = resolve_author_segment(title_candidate) if title_candidate else []
+            if (
+                (series or "Standalone") == "Standalone"
+                and volume == (0, "00")
+                and len(resolved_title_authors) == 1
+                and author_token_signature(title_candidate) == author_token_signature(resolved_title_authors[0])
+            ):
+                author = clean_author_segment(resolved_title_authors[0])
+                title = "Bez tytulu"
+                recovered_existing_author_from_title = True
+        title = sanitize_title(title, series or "Standalone", volume) or clean(title)
         local_prototype = LocalPrototype(
             path=meta.path,
             author=author,
@@ -874,6 +926,9 @@ def infer_record(
             extract_isbns=extract_isbns,
             meta=meta,
         )
+        if recovered_existing_author_from_title:
+            record.notes.append("existing-format:author-recovered-from-title")
+            record.decision_reasons.append("existing-format:author-recovered-from-title")
         if emit_stage is not None:
             emit_stage("lokalne-dopasowanie", record.source)
         trace_state(
@@ -987,20 +1042,30 @@ def infer_record(
             and " -- " not in inference_meta.core
             and bool(inference_meta.core)
         )
+        author_only_source = author_only_core or source == "hybrid:compact-author-only"
         if local_title and title_override:
             if len(title_override) > len(local_title) + 12 or hex_noise_re.search(title_override) or anna_archive_re.search(title_override):
                 title = local_title
                 title_from_core = False
 
-        title = strip_author_from_title(title, author)
-        title = clean(anna_archive_re.sub("", title))
-        title = sanitize_title(title, series, volume)
-        if title and author_only_core and (
-            normalize_match_text(title) == normalize_match_text(author)
-            or normalize_match_text(extract_authors([], title)) == normalize_match_text(author)
+        normalized_author = normalize_match_text(author)
+        author_signature = author_token_signature(author)
+        if title and author_only_source and normalized_author and (
+            normalize_match_text(title) == normalized_author
+            or author_token_signature(title) == author_signature
         ):
             title = "Bez tytulu"
             title_from_core = False
+        else:
+            title = strip_author_from_title(title, author)
+            title = clean(anna_archive_re.sub("", title))
+            title = sanitize_title(title, series, volume)
+            if title and author_only_source and (
+                normalize_match_text(title) == normalized_author
+                or author_token_signature(title) == author_signature
+            ):
+                title = "Bez tytulu"
+                title_from_core = False
         notes = list(meta.errors)
 
         local_prototype = LocalPrototype(

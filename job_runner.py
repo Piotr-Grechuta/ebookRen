@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, TypeAlias
 
+import embedded_metadata as embedded_metadata_mod
+
 
 RecordLike: TypeAlias = Any
 IsSupportedBookFile: TypeAlias = Callable[[Path], bool]
@@ -23,10 +25,12 @@ ExecuteMoves: TypeAlias = Callable[[list[Any]], list[str]]
 WriteReportFn: TypeAlias = Callable[..., None]
 FlushOnlineCache: TypeAlias = Callable[..., None]
 EmitProgress: TypeAlias = Callable[[str], None]
+WriteEmbeddedMetadata: TypeAlias = Callable[[Path, RecordLike], None]
 ProcessedManifest: TypeAlias = dict[str, dict[str, Any]]
 
 PROCESSED_MANIFEST_NAME = "ebookren_processed.json"
 SUCCESSFUL_PROCESSING_STATUSES = {"copied", "copied+archived", "moved", "renamed", "unchanged"}
+SUCCESSFUL_METADATA_STATUSES = {"copied", "copied+archived", "renamed", "unchanged"}
 
 if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "shlwapi"):
     _STRCMP_LOGICALW = ctypes.windll.shlwapi.StrCmpLogicalW
@@ -72,6 +76,41 @@ def actual_output_folder(record: RecordLike, default_folder: Path) -> Path:
 
 def target_path_for_record(record: RecordLike, default_folder: Path) -> Path:
     return actual_output_folder(record, default_folder) / record.filename
+
+
+def planned_embedded_metadata_status(record: RecordLike, target_folder: Path, *, enabled: bool) -> str:
+    if not enabled:
+        return "disabled"
+    suffix = target_path_for_record(record, target_folder).suffix.lower()
+    if suffix == ".epub" or suffix in embedded_metadata_mod.CALIBRE_WRITE_FORMATS:
+        return "planned"
+    return "skip-not-writable"
+
+
+def write_embedded_metadata_for_record(
+    record: RecordLike,
+    *,
+    target_folder: Path,
+    enabled: bool,
+    execution_status: dict[Path, str],
+    write_book_metadata: WriteEmbeddedMetadata,
+) -> tuple[str, str]:
+    if not enabled:
+        return "disabled", ""
+    status = execution_status.get(record.path.resolve(), "")
+    if status not in SUCCESSFUL_METADATA_STATUSES:
+        return "not-run", ""
+    destination = target_path_for_record(record, target_folder)
+    suffix = destination.suffix.lower()
+    if suffix != ".epub" and suffix not in embedded_metadata_mod.CALIBRE_WRITE_FORMATS:
+        return "skip-not-writable", ""
+    if not destination.exists():
+        return "failed", f"metadata-missing-target:{destination.name}"
+    try:
+        write_book_metadata(destination, record)
+    except Exception as exc:
+        return "failed", f"metadata:{destination.name}: {exc}"
+    return "written", ""
 
 
 def _path_key(path: Path) -> str:
@@ -180,6 +219,7 @@ def write_report(
     *,
     format_volume: FormatVolume,
     execution_status: dict[Path, str] | None = None,
+    embedded_metadata_status: dict[Path, str] | None = None,
 ) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle, delimiter=";")
@@ -210,6 +250,7 @@ def write_report(
                 "operation",
                 "archive_source_name",
                 "archive_source_folder",
+                "embedded_metadata_status",
                 "mode",
             ]
         )
@@ -220,6 +261,9 @@ def write_report(
             status = ""
             if execution_status is not None:
                 status = execution_status.get(row.path.resolve(), "")
+            metadata_status = ""
+            if embedded_metadata_status is not None:
+                metadata_status = embedded_metadata_status.get(row.path.resolve(), "")
             if not status:
                 if row.needs_review:
                     status = "review-required"
@@ -254,6 +298,7 @@ def write_report(
                     operation,
                     archive_path.name if isinstance(archive_path, Path) else "",
                     str(archive_path.parent) if isinstance(archive_path, Path) else "",
+                    metadata_status,
                     "dry-run" if dry_run else "apply",
                 ]
             )
@@ -516,6 +561,7 @@ def run_job(
     is_supported_book_file: IsSupportedBookFile,
     read_book_metadata: ReadBookMetadata,
     infer_record: InferRecord,
+    write_book_metadata: WriteEmbeddedMetadata,
     build_moves: BuildMoves,
     execute_moves: ExecuteMoves,
     format_volume: FormatVolume,
@@ -523,6 +569,7 @@ def run_job(
     set_output_folder_fn: Callable[[list[RecordLike], Path], list[RecordLike]],
     dedupe_destinations_fn: Callable[[list[RecordLike], Path], list[RecordLike]],
     flush_online_cache_if_needed: FlushOnlineCache,
+    write_epub_metadata: bool = True,
     emit_progress: EmitProgress | None = None,
     emit_trace: EmitProgress | None = None,
     skip_previously_processed: bool = False,
@@ -595,9 +642,12 @@ def run_job(
         execute_ms = 0
         records: list = []
         execution_status: dict[Path, str] = {}
+        embedded_metadata_status: dict[Path, str] = {}
         errors: list[str] = []
+        metadata_errors: list[str] = []
         to_write = 0
         written_total = 0
+        metadata_written_total = 0
         source_signatures: dict[Path, tuple[int, int]] = {}
 
         for index, path in enumerate(files, start=1):
@@ -632,45 +682,63 @@ def run_job(
             record = dedupe_destinations_fn([record], target_folder)[0]
             assign_archive_source_paths([record], archive_folder)
             records.append(record)
+            embedded_metadata_status[record.path.resolve()] = planned_embedded_metadata_status(
+                record,
+                target_folder,
+                enabled=write_epub_metadata,
+            )
             if emit_progress is not None:
                 emit_progress("\n".join(build_progress_lines(record, index=len(records), total=len(files), target_folder=target_folder)))
 
             if operation == "rename" and record.path.name == record.filename:
                 execution_status[record.path.resolve()] = "unchanged"
-                continue
-
-            moves = build_moves([record], folder, target_folder, archive_folder, stamp)
-            if not moves:
-                execution_status[record.path.resolve()] = "unchanged"
-                continue
-
-            to_write += len(moves)
-            execute_started_at = time.perf_counter()
-            move_errors = execute_moves(moves)
-            execute_ms += int((time.perf_counter() - execute_started_at) * 1000)
-            if move_errors:
-                execution_status[record.path.resolve()] = "failed"
-                errors.extend(move_errors)
             else:
-                if operation == "rename":
-                    execution_status[record.path.resolve()] = "renamed"
-                elif operation == "copy+archive":
-                    execution_status[record.path.resolve()] = "copied+archived"
+                moves = build_moves([record], folder, target_folder, archive_folder, stamp)
+                if not moves:
+                    execution_status[record.path.resolve()] = "unchanged"
                 else:
-                    execution_status[record.path.resolve()] = "copied"
-                written_total += len(moves)
-            update_processed_manifest_entry(
-                processed_manifest,
-                record.path,
-                status=execution_status[record.path.resolve()],
-                target_name=record.filename,
-                signature=source_signatures.get(record.path.resolve()),
+                    to_write += len(moves)
+                    execute_started_at = time.perf_counter()
+                    move_errors = execute_moves(moves)
+                    execute_ms += int((time.perf_counter() - execute_started_at) * 1000)
+                    if move_errors:
+                        execution_status[record.path.resolve()] = "failed"
+                        errors.extend(move_errors)
+                    else:
+                        if operation == "rename":
+                            execution_status[record.path.resolve()] = "renamed"
+                        elif operation == "copy+archive":
+                            execution_status[record.path.resolve()] = "copied+archived"
+                        else:
+                            execution_status[record.path.resolve()] = "copied"
+                        written_total += len(moves)
+
+            metadata_status, metadata_error = write_embedded_metadata_for_record(
+                record,
+                target_folder=target_folder,
+                enabled=write_epub_metadata,
+                execution_status=execution_status,
+                write_book_metadata=write_book_metadata,
             )
+            embedded_metadata_status[record.path.resolve()] = metadata_status
+            if metadata_status == "written":
+                metadata_written_total += 1
+            if metadata_error:
+                metadata_errors.append(metadata_error)
+            elif execution_status.get(record.path.resolve(), "") in SUCCESSFUL_PROCESSING_STATUSES:
+                update_processed_manifest_entry(
+                    processed_manifest,
+                    record.path,
+                    status=execution_status[record.path.resolve()],
+                    target_name=record.filename,
+                    signature=source_signatures.get(record.path.resolve()),
+                )
 
         if apply_changes:
             for record in records:
                 status = execution_status.get(record.path.resolve(), "")
-                if status == "unchanged":
+                metadata_status = embedded_metadata_status.get(record.path.resolve(), "")
+                if status == "unchanged" and metadata_status != "failed":
                     update_processed_manifest_entry(
                         processed_manifest,
                         record.path,
@@ -688,6 +756,7 @@ def run_job(
             target_folder=target_folder,
             operation=operation,
             execution_status=execution_status,
+            embedded_metadata_status=embedded_metadata_status,
         )
         review_total = sum(1 for record in records if record.needs_review)
         lines.append(
@@ -705,6 +774,9 @@ def run_job(
                 f"ONLINE_HTTP_SLOTS={online_http_slots}",
                 f"TO_WRITE={to_write}",
                 f"WRITTEN={written_total}",
+                f"EMBEDDED_METADATA={'ON' if write_epub_metadata else 'OFF'}",
+                f"EMBEDDED_METADATA_WRITTEN={metadata_written_total}",
+                f"METADATA_ERRORS={len(metadata_errors)}",
                 f"REVIEW={review_total}",
                 f"ERRORS={len(errors)}",
                 f"REPORT={report_path}",
@@ -719,6 +791,9 @@ def run_job(
             lines.append("---ERRORS---")
             lines.extend(errors[:20])
             return 1, lines
+        if metadata_errors:
+            lines.append("---METADATA-WARNINGS---")
+            lines.extend(metadata_errors[:20])
         return 0, lines
 
     if emit_progress is not None:
@@ -808,11 +883,17 @@ def run_job(
     records = dedupe_destinations_fn(records, target_folder)
     records = assign_archive_source_paths(records, archive_folder)
     execution_status: dict[Path, str] = {}
+    embedded_metadata_status: dict[Path, str] = {}
     for record in records:
         if operation == "rename" and record.path.name == record.filename:
             execution_status[record.path.resolve()] = "unchanged"
         else:
             execution_status[record.path.resolve()] = "planned" if dry_run else "pending"
+        embedded_metadata_status[record.path.resolve()] = planned_embedded_metadata_status(
+            record,
+            target_folder,
+            enabled=write_epub_metadata,
+        )
 
     if dry_run:
         write_report_fn(
@@ -823,6 +904,7 @@ def run_job(
             target_folder=target_folder,
             operation=operation,
             execution_status=execution_status,
+            embedded_metadata_status=embedded_metadata_status,
         )
         to_write = len(build_moves(records, folder, target_folder, archive_folder, stamp))
         review_count = sum(1 for record in records if record.needs_review)
@@ -838,6 +920,7 @@ def run_job(
                 f"SKIPPED={len(skipped_files)}",
                 f"INFER_WORKERS={infer_workers}",
                 f"ONLINE_HTTP_SLOTS={online_http_slots}",
+                f"EMBEDDED_METADATA={'ON' if write_epub_metadata else 'OFF'}",
                 f"REVIEW={review_count}",
                 f"REPORT={report_path}",
                 f"PROFILE_READ_MS={read_ms}",
@@ -855,6 +938,9 @@ def run_job(
     execute_started_at = time.perf_counter()
     errors = execute_moves(moves)
     execute_ms = int((time.perf_counter() - execute_started_at) * 1000)
+    metadata_written_total = 0
+    metadata_errors: list[str] = []
+    move_execution_failed = bool(errors)
     if errors:
         for move in moves:
             execution_status[move.source.resolve()] = "failed"
@@ -869,6 +955,19 @@ def run_job(
                     execution_status[move.source.resolve()] = "moved"
             elif move.operation == "copy":
                 execution_status[move.source.resolve()] = "copied"
+    for record in records:
+        metadata_status, metadata_error = write_embedded_metadata_for_record(
+            record,
+            target_folder=target_folder,
+            enabled=write_epub_metadata,
+            execution_status=execution_status,
+            write_book_metadata=write_book_metadata,
+        )
+        embedded_metadata_status[record.path.resolve()] = metadata_status
+        if metadata_status == "written":
+            metadata_written_total += 1
+        if metadata_error:
+            metadata_errors.append(metadata_error)
     write_report_fn(
         report_path,
         records,
@@ -877,22 +976,25 @@ def run_job(
         target_folder=target_folder,
         operation=operation,
         execution_status=execution_status,
+        embedded_metadata_status=embedded_metadata_status,
     )
     review_total = sum(1 for record in records if record.needs_review)
-    written_total = len(moves) if not errors else 0
-    if not errors:
+    written_total = len(moves) if not move_execution_failed else 0
+    if not move_execution_failed:
         for move in moves:
             status = execution_status.get(move.source.resolve(), "")
-            update_processed_manifest_entry(
-                processed_manifest,
-                move.source,
-                status=status,
-                target_name=move.record.filename,
-                signature=file_signature(move.source),
-            )
+            if embedded_metadata_status.get(move.source.resolve(), "") != "failed":
+                update_processed_manifest_entry(
+                    processed_manifest,
+                    move.source,
+                    status=status,
+                    target_name=move.record.filename,
+                    signature=file_signature(move.source),
+                )
         for record in records:
             status = execution_status.get(record.path.resolve(), "")
-            if status == "unchanged":
+            metadata_status = embedded_metadata_status.get(record.path.resolve(), "")
+            if status == "unchanged" and metadata_status != "failed":
                 update_processed_manifest_entry(processed_manifest, record.path, status=status, target_name=record.filename)
         save_processed_manifest(folder, processed_manifest)
 
@@ -911,6 +1013,9 @@ def run_job(
             f"ONLINE_HTTP_SLOTS={online_http_slots}",
             f"TO_WRITE={len(moves)}",
             f"WRITTEN={written_total}",
+            f"EMBEDDED_METADATA={'ON' if write_epub_metadata else 'OFF'}",
+            f"EMBEDDED_METADATA_WRITTEN={metadata_written_total}",
+            f"METADATA_ERRORS={len(metadata_errors)}",
             f"REVIEW={review_total}",
             f"ERRORS={len(errors)}",
             f"REPORT={report_path}",
@@ -925,4 +1030,7 @@ def run_job(
         lines.append("---ERRORS---")
         lines.extend(errors[:20])
         return 1, lines
+    if metadata_errors:
+        lines.append("---METADATA-WARNINGS---")
+        lines.extend(metadata_errors[:20])
     return 0, lines

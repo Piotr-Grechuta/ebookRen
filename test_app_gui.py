@@ -22,6 +22,7 @@ class AppGuiTests(unittest.TestCase):
                     destination_folder="g:\\books_out",
                     archive_folder="g:\\books_done",
                     online_mode="PL+",
+                    write_epub_metadata=True,
                 )
 
                 state = app_gui.load_gui_state()
@@ -33,6 +34,7 @@ class AppGuiTests(unittest.TestCase):
                 "destination_folder": "g:\\books_out",
                 "archive_folder": "g:\\books_done",
                 "online_mode": "PL+",
+                "write_epub_metadata": "true",
             },
         )
 
