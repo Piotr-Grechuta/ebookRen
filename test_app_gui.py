@@ -23,6 +23,17 @@ class AppGuiTests(unittest.TestCase):
                     archive_folder="g:\\books_done",
                     online_mode="PL+",
                     write_epub_metadata=True,
+                    metadata_folder="g:\\meta",
+                    metadata_tags="Killim, Arka",
+                    metadata_recursive=True,
+                    metadata_apply_changes=True,
+                    conversion_source_folder="g:\\convert_in",
+                    conversion_destination_folder="g:\\convert_out",
+                    conversion_tags="Killim",
+                    conversion_recursive=False,
+                    conversion_write_metadata=True,
+                    conversion_trash_sources=False,
+                    calibre_folder="C:\\Program Files\\Calibre2",
                 )
 
                 state = app_gui.load_gui_state()
@@ -35,6 +46,17 @@ class AppGuiTests(unittest.TestCase):
                 "archive_folder": "g:\\books_done",
                 "online_mode": "PL+",
                 "write_epub_metadata": "true",
+                "metadata_folder": "g:\\meta",
+                "metadata_tags": "Killim, Arka",
+                "metadata_recursive": "true",
+                "metadata_apply_changes": "true",
+                "conversion_source_folder": "g:\\convert_in",
+                "conversion_destination_folder": "g:\\convert_out",
+                "conversion_tags": "Killim",
+                "conversion_recursive": "false",
+                "conversion_write_metadata": "true",
+                "conversion_trash_sources": "false",
+                "calibre_folder": "C:\\Program Files\\Calibre2",
             },
         )
 

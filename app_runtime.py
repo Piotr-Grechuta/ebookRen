@@ -4,6 +4,11 @@ import random
 import threading
 import urllib.request
 import atexit
+import ctypes
+import os
+import re
+import shutil
+from ctypes import wintypes
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -1124,7 +1129,13 @@ def metadata_author_pairs(author_text: str) -> list[tuple[str, str]]:
     return pairs or [("Nieznany Autor", "Nieznany Autor")]
 
 
-def write_book_metadata(path: Path, record: BookRecord, *, extra_tags: list[str] | None = None) -> None:
+def write_book_metadata(
+    path: Path,
+    record: BookRecord,
+    *,
+    extra_tags: list[str] | None = None,
+    calibre_folder: Path | None = None,
+) -> None:
     author_pairs = metadata_author_pairs(record.author)
     creators = [display_name for display_name, _sort_key in author_pairs]
     creator_sort_keys = [sort_key for _display_name, sort_key in author_pairs]
@@ -1161,7 +1172,293 @@ def write_book_metadata(path: Path, record: BookRecord, *, extra_tags: list[str]
         clean=clean,
         clean_series=clean_series,
         normalize_match_text=normalize_match_text,
+        calibre_folder=calibre_folder,
     )
+
+
+CONVERSION_SOURCE_PRIORITIES = {
+    ".azw3": 90,
+    ".azw": 86,
+    ".mobi": 82,
+    ".fb2": 74,
+    ".rtf": 60,
+    ".lit": 54,
+    ".pdf": 46,
+    ".txt": 32,
+}
+
+
+def parse_extra_tags(text: str | None) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,\n;|]+", text or ""):
+        cleaned = clean(part)
+        key = normalize_match_text(cleaned)
+        if not cleaned or not key or key in seen:
+            continue
+        seen.add(key)
+        values.append(cleaned)
+    return values
+
+
+def iter_book_files(folder: Path, *, recursive: bool, include_epub: bool = True) -> list[Path]:
+    iterator = folder.rglob("*") if recursive else folder.iterdir()
+    files = [
+        path
+        for path in iterator
+        if path.is_file()
+        and is_supported_book_file(path)
+        and (include_epub or path.suffix.lower() != ".epub")
+    ]
+    return sorted(files, key=lambda path: str(path).lower())
+
+
+def _record_from_file_path(path: Path) -> BookRecord:
+    meta = read_book_metadata(path)
+    return infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+
+def run_metadata_backfill(
+    folder: Path,
+    *,
+    recursive: bool,
+    tags_text: str = "Killim",
+    apply_changes: bool = True,
+    limit: int = 0,
+    calibre_folder: Path | None = None,
+    emit_progress: Callable[[str], None] | None = None,
+) -> tuple[int, list[str]]:
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder nie istnieje: {folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"To nie jest folder: {folder}")
+
+    extra_tags = parse_extra_tags(tags_text)
+    files = iter_book_files(folder, recursive=recursive)
+    if limit > 0:
+        files = files[:limit]
+    if not files:
+        return 0, ["Brak obslugiwanych plikow ebook w wybranym folderze."]
+
+    written = 0
+    skipped = 0
+    errors = 0
+    lines: list[str] = []
+
+    for index, path in enumerate(files, start=1):
+        record = _record_from_file_path(path)
+        summary = (
+            f"[{index}/{len(files)}] {path.name} -> "
+            f"author={record.author} | series={record.series} | volume={record.volume} | title={record.title}"
+        )
+        try:
+            if apply_changes:
+                write_book_metadata(path, record, extra_tags=extra_tags, calibre_folder=calibre_folder)
+                written += 1
+                message = f"OK   {summary}"
+            else:
+                message = f"DRY  {summary}"
+        except ValueError as exc:
+            skipped += 1
+            message = f"SKIP {summary} | {exc}"
+        except Exception as exc:
+            errors += 1
+            message = f"ERR  {summary} | {exc}"
+        lines.append(message)
+        if emit_progress is not None:
+            emit_progress(message)
+
+    mode = "APPLY" if apply_changes else "DRY-RUN"
+    summary = f"Metadane zakonczone. MODE={mode} TOTAL={len(files)} WRITTEN={written} SKIPPED={skipped} ERRORS={errors}"
+    lines.append(summary)
+    if not apply_changes:
+        lines.append("Wlacz zapis, aby faktycznie dopisac metadane do plikow.")
+    return (1 if errors else 0), lines
+
+
+def conversion_source_priority(path: Path) -> tuple[int, int, str]:
+    priority = CONVERSION_SOURCE_PRIORITIES.get(path.suffix.lower(), 0)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return (priority, size, str(path).lower())
+
+
+def choose_conversion_source(paths: list[Path]) -> Path | None:
+    candidates = [path for path in paths if path.suffix.lower() != ".epub" and is_supported_book_file(path)]
+    if not candidates:
+        return None
+    return max(candidates, key=conversion_source_priority)
+
+
+def move_path_to_trash(path: Path) -> None:
+    target = path.resolve()
+    if not target.exists():
+        return
+    if os.name != "nt":
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", ctypes.c_ushort),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", wintypes.LPVOID),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    operation = SHFILEOPSTRUCTW()
+    operation.wFunc = 3
+    operation.pFrom = str(target) + "\0\0"
+    operation.fFlags = 0x0040 | 0x0010 | 0x0004 | 0x0400
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+    if result != 0 or operation.fAnyOperationsAborted:
+        raise OSError(result or "Operacja przeniesienia do kosza zostala anulowana.")
+
+
+def run_epub_export(
+    source_folder: Path,
+    destination_folder: Path,
+    *,
+    recursive: bool,
+    calibre_folder: Path | None = None,
+    tags_text: str = "Killim",
+    write_metadata_after_export: bool = True,
+    trash_sources_after_convert: bool = False,
+    emit_progress: Callable[[str], None] | None = None,
+) -> tuple[int, list[str]]:
+    if not source_folder.exists():
+        raise FileNotFoundError(f"Folder zrodlowy nie istnieje: {source_folder}")
+    if not source_folder.is_dir():
+        raise NotADirectoryError(f"To nie jest folder zrodlowy: {source_folder}")
+
+    destination_folder.mkdir(parents=True, exist_ok=True)
+    extra_tags = parse_extra_tags(tags_text)
+    files = iter_book_files(source_folder, recursive=recursive, include_epub=True)
+    if not files:
+        return 0, ["Brak obslugiwanych plikow ebook w folderze zrodlowym."]
+
+    groups: dict[tuple[str, str], list[Path]] = {}
+    for path in files:
+        relative_parent = path.relative_to(source_folder).parent
+        group_key = (str(relative_parent).lower(), path.stem.lower())
+        groups.setdefault(group_key, []).append(path)
+
+    converted = 0
+    moved_existing_epub = 0
+    skipped = 0
+    trashed = 0
+    errors = 0
+    metadata_written = 0
+    lines: list[str] = []
+    ordered_groups = sorted(groups.values(), key=lambda items: str(items[0]).lower())
+
+    for index, group in enumerate(ordered_groups, start=1):
+        ordered_group = sorted(group, key=lambda path: str(path).lower())
+        sample = ordered_group[0]
+        relative_parent = sample.relative_to(source_folder).parent
+        epubs = [path for path in ordered_group if path.suffix.lower() == ".epub"]
+        others = [path for path in ordered_group if path.suffix.lower() != ".epub"]
+
+        if epubs:
+            source_epub = epubs[0]
+            destination_path = destination_folder / relative_parent / source_epub.name
+            if destination_path.exists():
+                skipped += 1
+                message = f"SKIP [{index}/{len(ordered_groups)}] {source_epub.name} | docelowy EPUB juz istnieje"
+                lines.append(message)
+                if emit_progress is not None:
+                    emit_progress(message)
+                continue
+
+            try:
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source_epub), str(destination_path))
+                moved_existing_epub += 1
+                if write_metadata_after_export:
+                    try:
+                        record = _record_from_file_path(destination_path)
+                        write_book_metadata(destination_path, record, extra_tags=extra_tags)
+                        metadata_written += 1
+                    except Exception as exc:
+                        warning = f"WARN [{index}/{len(ordered_groups)}] {destination_path.name} | metadata: {exc}"
+                        lines.append(warning)
+                        if emit_progress is not None:
+                            emit_progress(warning)
+                for duplicate in epubs[1:] + others:
+                    move_path_to_trash(duplicate)
+                    trashed += 1
+                message = f"OK   [{index}/{len(ordered_groups)}] przeniesiono EPUB {source_epub.name}"
+            except Exception as exc:
+                errors += 1
+                message = f"ERR  [{index}/{len(ordered_groups)}] {source_epub.name} | {exc}"
+            lines.append(message)
+            if emit_progress is not None:
+                emit_progress(message)
+            continue
+
+        source_to_convert = choose_conversion_source(others)
+        if source_to_convert is None:
+            skipped += 1
+            message = f"SKIP [{index}/{len(ordered_groups)}] {sample.stem} | brak pliku do konwersji"
+            lines.append(message)
+            if emit_progress is not None:
+                emit_progress(message)
+            continue
+
+        destination_path = destination_folder / relative_parent / f"{source_to_convert.stem}.epub"
+        if destination_path.exists():
+            skipped += 1
+            message = f"SKIP [{index}/{len(ordered_groups)}] {destination_path.name} | docelowy EPUB juz istnieje"
+            lines.append(message)
+            if emit_progress is not None:
+                emit_progress(message)
+            continue
+
+        try:
+            embedded_metadata_mod.convert_to_epub_with_calibre(
+                source_to_convert,
+                destination_path,
+                calibre_folder=calibre_folder,
+            )
+            converted += 1
+            if write_metadata_after_export:
+                try:
+                    record = _record_from_file_path(source_to_convert)
+                    write_book_metadata(destination_path, record, extra_tags=extra_tags)
+                    metadata_written += 1
+                except Exception as exc:
+                    warning = f"WARN [{index}/{len(ordered_groups)}] {destination_path.name} | metadata: {exc}"
+                    lines.append(warning)
+                    if emit_progress is not None:
+                        emit_progress(warning)
+            if trash_sources_after_convert:
+                for duplicate in others:
+                    move_path_to_trash(duplicate)
+                    trashed += 1
+            message = f"OK   [{index}/{len(ordered_groups)}] skonwertowano {source_to_convert.name} -> {destination_path.name}"
+        except Exception as exc:
+            errors += 1
+            message = f"ERR  [{index}/{len(ordered_groups)}] {source_to_convert.name} | {exc}"
+        lines.append(message)
+        if emit_progress is not None:
+            emit_progress(message)
+
+    summary = (
+        "Eksport EPUB zakonczony. "
+        f"GROUPS={len(ordered_groups)} MOVED_EPUB={moved_existing_epub} CONVERTED={converted} "
+        f"METADATA={metadata_written} TRASHED={trashed} SKIPPED={skipped} ERRORS={errors}"
+    )
+    lines.append(summary)
+    return (1 if errors else 0), lines
 
 
 def extract_authors(creators: list[str], segment_author: str) -> str:

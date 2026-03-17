@@ -29,27 +29,71 @@ CALIBRE_WRITE_FORMATS = {
     ".txtz",
 }
 
+DEFAULT_CALIBRE_INSTALL_DIRS = (
+    Path(r"C:\Program Files\Calibre2"),
+    Path(r"C:\Program Files (x86)\Calibre2"),
+)
 
-def find_ebook_meta_binary() -> Path | None:
-    candidates: list[str] = []
-    discovered = shutil.which("ebook-meta")
-    if discovered:
-        candidates.append(discovered)
-    candidates.extend(
-        [
-            r"C:\Program Files\Calibre2\ebook-meta.exe",
-            r"C:\Program Files\Calibre2\ebook-meta.bat",
-        ]
-    )
+
+def _calibre_binary_candidates(binary_names: Iterable[str], calibre_folder: Path | None = None) -> list[Path]:
+    candidates: list[Path] = []
+    normalized_names = [str(name).strip() for name in binary_names if str(name).strip()]
+    if calibre_folder is not None:
+        folder = calibre_folder.expanduser()
+        if folder.is_file():
+            candidates.append(folder)
+            folder = folder.parent
+        for name in normalized_names:
+            candidates.append(folder / name)
+
+    for name in normalized_names:
+        discovered = shutil.which(name)
+        if discovered:
+            candidates.append(Path(discovered))
+
+    for folder in DEFAULT_CALIBRE_INSTALL_DIRS:
+        for name in normalized_names:
+            candidates.append(folder / name)
+
+    deduped: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
         normalized = str(candidate).strip()
-        if not normalized or normalized.lower() in seen:
+        if not normalized:
             continue
-        seen.add(normalized.lower())
-        path = Path(normalized)
-        if path.exists():
-            return path
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(Path(normalized))
+    return deduped
+
+
+def find_calibre_binary(binary_names: Iterable[str], *, calibre_folder: Path | None = None) -> Path | None:
+    for candidate in _calibre_binary_candidates(binary_names, calibre_folder=calibre_folder):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def find_ebook_meta_binary(*, calibre_folder: Path | None = None) -> Path | None:
+    return find_calibre_binary(
+        ("ebook-meta.exe", "ebook-meta.bat", "ebook-meta"),
+        calibre_folder=calibre_folder,
+    )
+
+
+def find_ebook_convert_binary(*, calibre_folder: Path | None = None) -> Path | None:
+    return find_calibre_binary(
+        ("ebook-convert.exe", "ebook-convert.bat", "ebook-convert"),
+        calibre_folder=calibre_folder,
+    )
+
+
+def detect_calibre_folder() -> Path | None:
+    for binary in (find_ebook_convert_binary(), find_ebook_meta_binary()):
+        if binary is not None:
+            return binary.parent
     return None
 
 
@@ -95,12 +139,13 @@ def write_metadata_with_calibre(
     clean: Callable[[str | None], str],
     clean_series: Callable[[str | None], str],
     normalize_match_text: Callable[[str | None], str],
+    calibre_folder: Path | None = None,
 ) -> None:
     suffix = path.suffix.lower()
     if suffix not in CALIBRE_WRITE_FORMATS:
         raise ValueError(f"metadata-write-unsupported:{suffix or '(brak rozszerzenia)'}")
 
-    ebook_meta = find_ebook_meta_binary()
+    ebook_meta = find_ebook_meta_binary(calibre_folder=calibre_folder)
     if ebook_meta is None:
         raise FileNotFoundError("Nie znaleziono calibre ebook-meta.exe")
 
@@ -153,3 +198,20 @@ def write_metadata_with_calibre(
         stderr = (completed.stderr or completed.stdout or "").strip()
         raise RuntimeError(stderr or f"ebook-meta exited with code {completed.returncode}")
 
+
+def convert_to_epub_with_calibre(source: Path, destination: Path, *, calibre_folder: Path | None = None) -> None:
+    ebook_convert = find_ebook_convert_binary(calibre_folder=calibre_folder)
+    if ebook_convert is None:
+        raise FileNotFoundError("Nie znaleziono calibre ebook-convert.exe")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [str(ebook_convert), str(source), str(destination)]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(stderr or f"ebook-convert exited with code {completed.returncode}")
