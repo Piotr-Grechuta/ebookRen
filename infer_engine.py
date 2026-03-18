@@ -153,6 +153,16 @@ def sanitize_title_for_online_query(
         if volume is not None:
             value = sanitize_title(value, series, volume) or value
     value = strip_author_from_title(value, author)
+    leading_series_with_paren_index = re.match(
+        r"^(?P<series>.+?)\s*\(\s*(?:(?:book|tom|volume|vol\.?|czesc|część|ksiega|księga)\s*)?(?:\d+(?:\.\d+)?|[IVXLCDM]+)\s*\)\s*(?:[-:._]\s*)?(?P<title>.+)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if leading_series_with_paren_index:
+        leading_series = clean(leading_series_with_paren_index.group("series"))
+        trailing_title = clean(leading_series_with_paren_index.group("title"))
+        if leading_series and trailing_title and len(leading_series.split()) >= 2:
+            value = trailing_title
     value = strip_leading_title_index(value)
     value = clean(value)
     return value
@@ -567,6 +577,45 @@ def sanitize_title(
     is_series_volume_only_title,
     clean,
 ) -> str:
+    def repair_rotated_trailing_linker_title(value: str) -> str:
+        tokens = [token for token in clean(value).split() if token]
+        if len(tokens) < 3:
+            return clean(value)
+        trailing_linkers = {"a", "do", "i", "na", "o", "od", "po", "u", "w", "we", "z", "za", "ze"}
+        last_token = re.sub(r"[\W_]+", "", tokens[-1], flags=re.UNICODE).lower()
+        first_token = re.sub(r"[\W_]+", "", tokens[0], flags=re.UNICODE)
+        if last_token not in trailing_linkers or len(first_token) < 4 or not tokens[0][:1].isupper():
+            return clean(value)
+        if re.fullmatch(r"[IVXLCDM]+|\d+(?:\.\d+)?", first_token, flags=re.IGNORECASE):
+            return clean(value)
+        middle_tokens = [
+            re.sub(r"[\W_]+", "", token, flags=re.UNICODE)
+            for token in tokens[1:-1]
+        ]
+        middle_tokens = [token for token in middle_tokens if token]
+        if len(middle_tokens) < 1 or not any(len(token) >= 4 for token in middle_tokens):
+            return clean(value)
+        repaired = clean(" ".join(tokens[1:] + [tokens[0]]))
+        return repaired or clean(value)
+
+    def repair_front_loaded_tail_word(value: str) -> str:
+        tokens = [token for token in clean(value).split() if token]
+        if len(tokens) < 2:
+            return clean(value)
+        front_word = re.sub(r"[\W_]+", "", tokens[0], flags=re.UNICODE)
+        second_word = re.sub(r"[\W_]+", "", tokens[1], flags=re.UNICODE)
+        blocked_front_words = {"a", "do", "i", "na", "o", "od", "po", "u", "w", "we", "z", "za", "ze"}
+        if (
+            len(front_word) < 3
+            or front_word.lower() in blocked_front_words
+            or not tokens[0][:1].islower()
+            or not second_word
+            or not tokens[1][:1].isupper()
+        ):
+            return clean(value)
+        repaired = clean(" ".join(tokens[1:] + [tokens[0]]))
+        return repaired or clean(value)
+
     title = strip_source_artifacts(title)
     if not title:
         return ""
@@ -579,7 +628,9 @@ def sanitize_title(
         title = re.sub(suffix, "", title, flags=re.IGNORECASE)
     if is_series_volume_only_title(title, series, volume):
         return ""
-    return clean(title)
+    repaired_title = repair_rotated_trailing_linker_title(title)
+    repaired_title = repair_front_loaded_tail_word(repaired_title)
+    return repaired_title
 
 
 def is_series_volume_only_title(
@@ -635,11 +686,14 @@ def extract_authors(creators: list[str], segment_author: str, *, resolve_author_
     def token_signature(text: str) -> tuple[str, ...]:
         return tuple(re.sub(r"[\W\d_]+", "", token, flags=re.UNICODE).lower() for token in text.split() if token)
 
+    def author_identity_key(text: str) -> tuple[str, ...]:
+        return tuple(sorted(part for part in token_signature(text) if part))
+
     def extend_ordered(values: list[str]) -> None:
-        seen = {re.sub(r"[^a-z0-9]", "", to_last_first(item).lower()) for item in ordered}
+        seen = {author_identity_key(item) for item in ordered if author_identity_key(item)}
         for value in values:
             normalized = to_last_first(value)
-            key = re.sub(r"[^a-z0-9]", "", normalized.lower())
+            key = author_identity_key(normalized)
             if normalized and key and key not in seen:
                 seen.add(key)
                 ordered.append(normalized)
@@ -674,9 +728,9 @@ def extract_authors(creators: list[str], segment_author: str, *, resolve_author_
         else:
             raw.extend(values)
     result = list(ordered)
-    seen = {re.sub(r"[^a-z0-9]", "", item.lower()) for item in result}
+    seen = {author_identity_key(item) for item in result if author_identity_key(item)}
     for item in canonicalize_authors(raw):
-        key = re.sub(r"[^a-z0-9]", "", item.lower())
+        key = author_identity_key(item)
         if key and key not in seen:
             seen.add(key)
             result.append(item)
@@ -697,6 +751,18 @@ def build_online_query_variants(
 ) -> list[EpubMetadata]:
     variants: list[EpubMetadata] = []
     seen: set[tuple[str, tuple[str, ...]]] = set()
+
+    def looks_structural_chunk(value: str) -> bool:
+        normalized = normalize_match_text(value)
+        if not normalized:
+            return True
+        if normalized == normalize_match_text("standalone"):
+            return True
+        if re.fullmatch(r"tom \d+(?: \d+)?", normalized):
+            return True
+        if normalized in {"tom", "book", "part", "volume", "vol"}:
+            return True
+        return False
 
     def add_variant(title: str, creators: list[str]) -> None:
         normalized_title = clean(title)
@@ -739,6 +805,20 @@ def build_online_query_variants(
         add_variant(cleaned_title, prototype_authors or list(meta.creators))
         if prototype.series and prototype.series != "Standalone":
             add_variant(f"{prototype.series} {cleaned_title}", prototype_authors or list(meta.creators))
+    if " - " in meta.core:
+        chunks = [clean(part) for part in re.split(r"\s+-\s+", meta.core) if clean(part)]
+        candidate_chunks = [
+            chunk
+            for chunk in chunks
+            if not looks_structural_chunk(chunk)
+            and normalize_match_text(chunk) != normalize_match_text(prototype.author)
+            and normalize_match_text(chunk) != normalize_match_text(prototype.series)
+        ]
+        if candidate_chunks:
+            longest_chunk = max(candidate_chunks, key=lambda value: (len(normalize_match_text(value)), len(value)))
+            repaired_chunk = sanitize_title_for_online_query(longest_chunk, "", "", None) or longest_chunk
+            if normalize_match_text(repaired_chunk) != normalize_match_text(cleaned_title):
+                add_variant(repaired_chunk, [])
     if meta.title and clean(meta.title) != clean(prototype.title):
         add_variant(meta.title, list(meta.creators))
     return variants

@@ -111,6 +111,14 @@ class OnlineRoleEvidence:
 
 
 @dataclass(frozen=True)
+class OnlineSeriesEvidence:
+    series: str = ""
+    volume: tuple[int, str] | None = None
+    cycle_source: str = ""
+    authoritative: bool = False
+
+
+@dataclass(frozen=True)
 class HybridLocalParse:
     title_hint: str = ""
     author_hint: str = ""

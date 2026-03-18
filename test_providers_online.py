@@ -144,5 +144,24 @@ class ProvidersOnlineTests(unittest.TestCase):
         self.assertEqual(calls, ["google"])
 
 
+    def test_parse_lubimyczytac_detail_page_falls_back_to_series_when_cycle_missing(self) -> None:
+        page = (
+            '<span class="d-none d-sm-block mt-1"> Seria:'
+            '<a href="/seria/65/swiat-czarownic"> Świat Czarownic </a></span>'
+            '<a class="book__category d-sm-block d-none" href="/kategoria/fantasy-science-fiction"> fantasy, science fiction </a>'
+        )
+        series, volume, genres = providers_online.parse_lubimyczytac_detail_page(
+            page,
+            clean=clean,
+            strip_html_tags=lambda text: clean(re.sub(r"<[^>]+>", " ", text or "")),
+            clean_series=clean,
+            parse_volume_parts=infer_core.parse_volume_parts,
+            series_only_paren_index_re=SERIES_ONLY_PAREN_INDEX_RE,
+        )
+
+        self.assertEqual(series, "Świat Czarownic")
+        self.assertIsNone(volume)
+        self.assertEqual(genres, ["fantasy, science fiction"])
+
 if __name__ == "__main__":
     unittest.main()

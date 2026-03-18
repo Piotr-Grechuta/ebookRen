@@ -291,6 +291,18 @@ class KodV3Tests(unittest.TestCase):
             "Ludlum Robert & van Lustbader Eric",
         )
 
+    def test_extract_authors_drops_single_lowercase_noise_fragment(self) -> None:
+        self.assertEqual(
+            kod_v3.extract_authors(["Piotr Ambroziewicz & word"], ""),
+            "Ambroziewicz Piotr",
+        )
+
+    def test_extract_authors_dedupes_reversed_single_author_variants(self) -> None:
+        self.assertEqual(
+            kod_v3.extract_authors(["Ambroziewicz Piotr & Piotr Ambroziewicz"], ""),
+            "Ambroziewicz Piotr",
+        )
+
     def test_build_online_record_filters_non_author_noise_from_author_list(self) -> None:
         meta = make_meta("Świat Bourne'a")
         best = kod_v3.RankedOnlineMatch(
@@ -1216,6 +1228,21 @@ class KodV3Tests(unittest.TestCase):
             ),
         )
 
+    def test_parse_existing_filename_extracts_embedded_series_and_volume_from_standalone_title_with_space_after_paren_index(self) -> None:
+        parsed = kod_v3.parse_existing_filename(
+            "Norton Andre - Standalone - Tom 00.00 - \u015awiat Czarownic (15) Gryf w chwale"
+        )
+        self.assertEqual(
+            parsed,
+            (
+                "Norton Andre",
+                "\u015awiat Czarownic",
+                (15, "00"),
+                "Gryf w chwale",
+                "",
+            ),
+        )
+
     def test_parse_existing_filename_rejects_structural_placeholder_series_and_title(self) -> None:
         parsed = kod_v3.parse_existing_filename(
             "Styles W - Agatha Christi - Styles Tajemnicza historia w - Standalone - Tom - Tom 00.00 - Tom 00.00"
@@ -1372,6 +1399,38 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(record.source, "hybrid:prefixed-noise-title-author")
         self.assertEqual(record.author, "Wasilij Aksjonow")
         self.assertEqual(record.title, "Wiezienie i pokoj")
+
+    def test_infer_record_reinterprets_existing_format_when_trailing_segment_is_known_author(self) -> None:
+        meta = make_meta("AN 03 - Nie ma takiego miasta - Tom 00.00 - Konatkowski Tomasz")
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.source, "existing-format")
+        self.assertEqual(record.author, "Tomasz Konatkowski")
+        self.assertEqual(record.series, "Standalone")
+        self.assertEqual(record.volume, (0, "00"))
+        self.assertEqual(record.title, "Nie ma takiego miasta")
+        self.assertIn("existing-format:trailing-author-reinterpreted", record.notes)
+        self.assertEqual(
+            record.filename,
+            "Tomasz Konatkowski - Standalone - Tom 00.00 - Nie ma takiego miasta.epub",
+        )
+
+    def test_infer_record_reinterprets_existing_format_with_code_prefix_and_explicit_volume(self) -> None:
+        meta = make_meta("AN 03 - Nie ma takiego miasta - Tom 01.00 - Konatkowski Tomasz")
+
+        record = kod_v3.infer_record(meta, use_online=False, providers=[], timeout=1.0)
+
+        self.assertEqual(record.source, "existing-format")
+        self.assertEqual(record.author, "Tomasz Konatkowski")
+        self.assertEqual(record.series, "Standalone")
+        self.assertEqual(record.volume, (1, "00"))
+        self.assertEqual(record.title, "Nie ma takiego miasta")
+        self.assertIn("existing-format:trailing-author-reinterpreted", record.notes)
+        self.assertEqual(
+            record.filename,
+            "Tomasz Konatkowski - Standalone - Tom 01.00 - Nie ma takiego miasta.epub",
+        )
 
     def test_online_applied_does_not_force_review(self) -> None:
         meta = make_meta("Series 1: Title", creators=["Known Author"])
@@ -1788,6 +1847,18 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(volume, (2, "00"))
         self.assertEqual(genres, [])
 
+    def test_parse_lubimyczytac_detail_page_falls_back_to_series_label(self) -> None:
+        page = (
+            '<span class="d-none d-sm-block mt-1"> Seria:'
+            '<a href="/seria/65/swiat-czarownic"> Swiat Czarownic </a></span>'
+            '<a class="book__category d-sm-block d-none" href="/kategoria/beletrystyka/fantasy-science-fiction">'
+            ' fantasy, science fiction </a>'
+        )
+        series, volume, genres = kod_v3.parse_lubimyczytac_detail_page(page)
+        self.assertEqual(series, "Swiat Czarownic")
+        self.assertIsNone(volume)
+        self.assertEqual(genres, ["fantasy, science fiction"])
+
     def test_parse_lubimyczytac_detail_page_extracts_genre_from_generic_category_link(self) -> None:
         page = '<a href="/kategoria/literatura-piekna/literatura-wspolczesna"> literatura wspolczesna </a>'
 
@@ -1817,6 +1888,29 @@ class KodV3Tests(unittest.TestCase):
         best = max(candidates, key=lambda item: item.score)
         self.assertEqual(best.series, "Czerwona Kr?lowa")
         self.assertEqual(best.volume, (3, "00"))
+        self.assertEqual(best.genre, "fantasy, science fiction")
+
+    def test_lubimyczytac_candidates_enrich_from_detail_page_with_series_only(self) -> None:
+        meta = make_meta("Madrosc Swiata Czarownic", creators=["Andre Norton"])
+        search_page = (
+            '<a class="authorAllBooks__singleTextTitle" href="/ksiazka/129600/madrosc-swiata-czarownic"> Madrosc Swiata Czarownic </a>'
+            '<div class="authorAllBooks__singleTextAuthor"><a href="/autor/1/andre-norton">Andre Norton</a></div>'
+        )
+        detail_page = (
+            '<span class="d-none d-sm-block mt-1"> Seria:<a href="/seria/65/swiat-czarownic"> Swiat Czarownic </a></span>'
+            '<a class="book__category d-sm-block d-none" href="/kategoria/beletrystyka/fantasy-science-fiction"> fantasy, science fiction </a>'
+        )
+        with mock.patch.object(
+            kod_v3,
+            "online_text_query",
+            side_effect=lambda url, timeout: detail_page if "ksiazka/129600" in url else search_page,
+        ):
+            candidates = kod_v3.lubimyczytac_candidates(meta, 2.0)
+        self.assertTrue(candidates)
+        best = max(candidates, key=lambda item: item.score)
+        self.assertEqual(best.series, "Swiat Czarownic")
+        self.assertIsNone(best.volume)
+        self.assertEqual(best.cycle_source, "detail")
         self.assertEqual(best.genre, "fantasy, science fiction")
 
     def test_lubimyczytac_candidates_fallback_to_raw_category_when_mapping_is_unknown(self) -> None:

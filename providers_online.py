@@ -151,6 +151,69 @@ def build_lubimyczytac_search_parser_factory(
     return parser_factory
 
 
+def parse_lubimyczytac_detail_series_label(
+    page: str,
+    label: str,
+    *,
+    clean: Callable[[str | None], str],
+    strip_html_tags: Callable[[str | None], str],
+    clean_series: Callable[[str | None], str],
+    parse_volume_parts: Callable[[str | None], tuple[int, str] | None],
+    series_only_paren_index_re,
+) -> tuple[str, tuple[int, str] | None]:
+    label_match = re.search(
+        rf"{label}:\s*<a[^>]*>\s*([^<]+?)\s*</a>",
+        page,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not label_match:
+        label_match = re.search(
+            rf"Kategoria:.*?<dt[^>]*>\s*{label}:\s*</dt>\s*<dd[^>]*>\s*<a[^>]*>\s*([^<]+?)\s*</a>",
+            page,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    if not label_match:
+        return "", None
+    cycle_text = clean(html.unescape(strip_html_tags(label_match.group(1))))
+    if cycle_text:
+        series_match = series_only_paren_index_re.match(cycle_text)
+        if series_match:
+            return clean_series(series_match.group(1)), parse_volume_parts(series_match.group(2))
+        return clean_series(cycle_text), None
+    return "", None
+
+
+def parse_lubimyczytac_detail_series(
+    page: str,
+    *,
+    clean: Callable[[str | None], str],
+    strip_html_tags: Callable[[str | None], str],
+    clean_series: Callable[[str | None], str],
+    parse_volume_parts: Callable[[str | None], tuple[int, str] | None],
+    series_only_paren_index_re,
+) -> tuple[str, tuple[int, str] | None]:
+    series, volume = parse_lubimyczytac_detail_series_label(
+        page,
+        "Cykl",
+        clean=clean,
+        strip_html_tags=strip_html_tags,
+        clean_series=clean_series,
+        parse_volume_parts=parse_volume_parts,
+        series_only_paren_index_re=series_only_paren_index_re,
+    )
+    if not series and volume is None:
+        series, volume = parse_lubimyczytac_detail_series_label(
+            page,
+            "Seria",
+            clean=clean,
+            strip_html_tags=strip_html_tags,
+            clean_series=clean_series,
+            parse_volume_parts=parse_volume_parts,
+            series_only_paren_index_re=series_only_paren_index_re,
+        )
+    return series, volume
+
+
 def parse_lubimyczytac_detail_page(
     page: str,
     *,
@@ -160,26 +223,15 @@ def parse_lubimyczytac_detail_page(
     parse_volume_parts: Callable[[str | None], tuple[int, str] | None],
     series_only_paren_index_re,
 ) -> tuple[str, tuple[int, str] | None, list[str]]:
-    series = ""
-    volume: tuple[int, str] | None = None
     genres: list[str] = []
-
-    cycle_match = re.search(r"Cykl:\s*<a[^>]*>\s*([^<]+?)\s*</a>", page, flags=re.IGNORECASE | re.DOTALL)
-    if not cycle_match:
-        cycle_match = re.search(
-            r"Kategoria:.*?<dt[^>]*>\s*Cykl:\s*</dt>\s*<dd[^>]*>\s*<a[^>]*>\s*([^<]+?)\s*</a>",
-            page,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-    if cycle_match:
-        cycle_text = clean(html.unescape(strip_html_tags(cycle_match.group(1))))
-        if cycle_text:
-            series_match = series_only_paren_index_re.match(cycle_text)
-            if series_match:
-                series = clean_series(series_match.group(1))
-                volume = parse_volume_parts(series_match.group(2))
-            else:
-                series = clean_series(cycle_text)
+    series, volume = parse_lubimyczytac_detail_series(
+        page,
+        clean=clean,
+        strip_html_tags=strip_html_tags,
+        clean_series=clean_series,
+        parse_volume_parts=parse_volume_parts,
+        series_only_paren_index_re=series_only_paren_index_re,
+    )
 
     for pattern in (
         r'class="book__category[^"]*"[^>]*>\s*([^<]+?)\s*</a>',
@@ -194,6 +246,26 @@ def parse_lubimyczytac_detail_page(
             break
 
     return series, volume, genres
+
+
+def merge_lubimyczytac_detail_result(
+    result,
+    *,
+    series: str,
+    volume: tuple[int, str] | None,
+    genres: list[str],
+    result_type,
+):
+    cycle_source = "detail" if series or volume is not None else getattr(result, "cycle_source", "")
+    return result_type(
+        title=result.title,
+        authors=list(result.authors),
+        series=series or result.series,
+        volume=volume or result.volume,
+        url=result.url,
+        genres=genres or list(result.genres),
+        cycle_source=cycle_source,
+    )
 
 
 def enrich_lubimyczytac_result(
@@ -211,15 +283,12 @@ def enrich_lubimyczytac_result(
     if not page:
         return result
     series, volume, genres = parse_detail_page(page)
-    cycle_source = "detail" if series or volume is not None else getattr(result, "cycle_source", "")
-    return result_type(
-        title=result.title,
-        authors=list(result.authors),
-        series=series or result.series,
-        volume=volume or result.volume,
-        url=result.url,
-        genres=genres or list(result.genres),
-        cycle_source=cycle_source,
+    return merge_lubimyczytac_detail_result(
+        result,
+        series=series,
+        volume=volume,
+        genres=genres,
+        result_type=result_type,
     )
 
 
