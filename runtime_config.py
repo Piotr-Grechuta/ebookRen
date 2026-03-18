@@ -122,6 +122,17 @@ AI_REQUEST_CONFIDENCE_THRESHOLD = 75
 AI_AUTO_APPLY_CONFIDENCE = 88
 AI_CLI_TIMEOUT_SECONDS = 120
 AI_SANDBOX_MODE = "read-only"
+AI_ENABLE_WEB_RESEARCH = True
+AI_RESEARCH_SOURCES = (
+    "strony autorow i wydawcow",
+    "OpenLibrary",
+    "WorldCat",
+    "Fantastic Fiction",
+    "Goodreads",
+    "Wikipedia",
+    "katalogi bibliotek",
+    "ksiegarnie i strony ksiazek",
+)
 ONLINE_ERROR_CACHE_TTL = 60.0
 LUBIMYCZYTAC_HOST = "lubimyczytac.pl"
 LUBIMYCZYTAC_SEARCH_DELAY_RANGE = (2.4, 5.6)
@@ -132,6 +143,7 @@ BLOCKING_REVIEW_REASONS = {
     "nieznany-autor",
     "brak-tytulu",
     "fallback",
+    "seria-bez-tomu",
     "szum-w-tytule",
     "artefakt-zrodla",
 }

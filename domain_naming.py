@@ -582,6 +582,9 @@ def finalize_record_quality(
     if record.source == "fallback":
         confidence -= 15
         review_reasons.append("fallback")
+    if record.series and record.series != "Standalone" and record.volume in {None, (0, "00")}:
+        confidence -= 12
+        review_reasons.append("seria-bez-tomu")
     if meta.errors:
         confidence -= 10
         review_reasons.append("blad-odczytu-metadanych")

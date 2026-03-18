@@ -113,6 +113,53 @@ class AiResolverTests(unittest.TestCase):
         self.assertEqual(response.confidence, 93)
         self.assertEqual(response.decision_reasons, ["ai:test"])
 
+    def test_build_ai_resolution_prompt_allows_web_research_with_preferred_sources(self) -> None:
+        request = ai_resolver.build_ai_resolution_request(
+            DummyRecord(
+                path=Path("source.epub"),
+                author="Norton Andre",
+                series="Świat Czarownic",
+                volume=None,
+                title="Mądrość Świata Czarownic",
+                source="lubimyczytac",
+                identifiers=[],
+                notes=[],
+                confidence=60,
+                review_reasons=["seria-bez-tomu"],
+            ),
+            self.make_meta(),
+            ["review:seria-bez-tomu"],
+        )
+
+        prompt = ai_resolver.build_ai_resolution_prompt(
+            request,
+            allow_web_research=True,
+            allowed_sources=("OpenLibrary", "WorldCat", "Wikipedia"),
+        )
+
+        self.assertIn("dodatkowy research w sieci", prompt)
+        self.assertIn("nie ograniczaj sie do LubimyCzytac", prompt)
+        self.assertIn("OpenLibrary, WorldCat, Wikipedia", prompt)
+        self.assertIn("ai-research:web", prompt)
+
+    def test_collect_ai_review_signals_includes_series_without_volume(self) -> None:
+        record = DummyRecord(
+            path=Path("source.epub"),
+            author="Norton Andre",
+            series="Świat Czarownic",
+            volume=None,
+            title="Mądrość Świata Czarownic",
+            source="lubimyczytac",
+            identifiers=[],
+            notes=[],
+            confidence=60,
+            review_reasons=["seria-bez-tomu"],
+        )
+
+        signals = ai_resolver.collect_ai_review_signals(record, self.make_meta(), confidence_threshold=75)
+
+        self.assertIn("review:seria-bez-tomu", signals)
+
     def test_resolve_record_with_ai_review_mode_only_queues_case(self) -> None:
         record = DummyRecord(
             path=Path("source.epub"),
@@ -138,6 +185,8 @@ class AiResolverTests(unittest.TestCase):
             auto_apply_confidence=88,
             timeout_seconds=1,
             sandbox_mode="read-only",
+            allow_web_research=True,
+            allowed_sources=("OpenLibrary", "WorldCat"),
             workdir=None,
             run_prompt_fn=run_prompt,
         )
@@ -172,6 +221,8 @@ class AiResolverTests(unittest.TestCase):
             auto_apply_confidence=88,
             timeout_seconds=1,
             sandbox_mode="read-only",
+            allow_web_research=True,
+            allowed_sources=("OpenLibrary", "WorldCat"),
             workdir=None,
             run_prompt_fn=lambda _prompt, **kwargs: (
                 '{"author":"Tomasz Konatkowski","series":"Standalone","volume":null,'
@@ -209,10 +260,12 @@ class AiResolverTests(unittest.TestCase):
             auto_apply_confidence=88,
             timeout_seconds=1,
             sandbox_mode="read-only",
+            allow_web_research=True,
+            allowed_sources=("OpenLibrary", "WorldCat"),
             workdir=None,
             run_prompt_fn=lambda _prompt, **kwargs: (
                 '{"author":"Tomasz Konatkowski","series":"Standalone","volume":null,'
-                '"title":"Nie ma takiego miasta","confidence":95,"decision_reasons":["ai:known-author-tail"]}'
+                '"title":"Nie ma takiego miasta","confidence":95,"decision_reasons":["ai:known-author-tail","ai-research:web"]}'
             ),
         )
 
@@ -226,6 +279,7 @@ class AiResolverTests(unittest.TestCase):
         self.assertEqual(resolved.confidence, 95)
         self.assertIn("ai-local:applied", resolved.notes)
         self.assertIn("ai-local:auto-applied", resolved.decision_reasons)
+        self.assertIn("ai-research:web", resolved.decision_reasons)
         self.assertNotIn("nieznany-autor", resolved.review_reasons)
         self.assertNotIn("brak-tytulu", resolved.review_reasons)
         self.assertNotIn("fallback", resolved.review_reasons)
@@ -253,6 +307,8 @@ class AiResolverTests(unittest.TestCase):
             auto_apply_confidence=88,
             timeout_seconds=1,
             sandbox_mode="read-only",
+            allow_web_research=True,
+            allowed_sources=("OpenLibrary", "WorldCat"),
             workdir=None,
             run_prompt_fn=lambda _prompt, **kwargs: (
                 '{"author":"Tomasz Konatkowski","series":"Standalone","volume":null,'

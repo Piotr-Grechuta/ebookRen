@@ -25,6 +25,7 @@ STRUCTURAL_REVIEW_REASONS = {
     "nieznany-autor",
     "brak-tytulu",
     "fallback",
+    "seria-bez-tomu",
     "szum-w-tytule",
     "artefakt-zrodla",
     "online-brak-potwierdzenia-autora",
@@ -138,8 +139,23 @@ def request_to_payload(request: AiResolutionRequest) -> dict[str, Any]:
     return asdict(request)
 
 
-def build_ai_resolution_prompt(request: AiResolutionRequest) -> str:
+def build_ai_resolution_prompt(
+    request: AiResolutionRequest,
+    *,
+    allow_web_research: bool,
+    allowed_sources: list[str] | tuple[str, ...],
+) -> str:
     payload = json.dumps(request_to_payload(request), ensure_ascii=False, indent=2)
+    research_lines = ""
+    if allow_web_research:
+        preferred_sources = ", ".join(source for source in allowed_sources if infer_core.clean(source))
+        research_lines = (
+            "- mozesz wykonac dodatkowy research w sieci, gdy lokalne dane nie wystarczaja\n"
+            "- nie ograniczaj sie do LubimyCzytac; preferuj: "
+            f"{preferred_sources}\n"
+            "- przy sprzecznych zrodlach wybierz ostrozny wynik i obniz confidence\n"
+            "- jesli uzyjesz researchu webowego, dodaj do decision_reasons tag ai-research:web lub ai-research:<zrodlo>\n"
+        )
     return (
         "Rozstrzygasz niejednoznaczne przypadki zmiany nazw ebookow.\n"
         "Masz poprawic tylko pola author, series, volume, title.\n"
@@ -153,6 +169,7 @@ def build_ai_resolution_prompt(request: AiResolutionRequest) -> str:
         "- volume ma byc null albo [liczba_calkowita, dwucyfrowa_czesc_dziesietna]\n"
         "- author i title nie moga byc puste\n"
         "- decision_reasons maja byc krotkie i techniczne\n"
+        f"{research_lines}"
         "Dane wejsciowe JSON:\n"
         f"{payload}"
     )
@@ -378,6 +395,8 @@ def resolve_record_with_ai(
     auto_apply_confidence: int,
     timeout_seconds: int,
     sandbox_mode: str,
+    allow_web_research: bool,
+    allowed_sources: list[str] | tuple[str, ...],
     workdir: Path | None,
     run_prompt_fn: Callable[..., str] = run_local_codex,
 ) -> tuple[object, dict[str, Any] | None]:
@@ -397,7 +416,11 @@ def resolve_record_with_ai(
     if normalized_mode == AI_MODE_REVIEW:
         return record, log_entry
 
-    prompt = build_ai_resolution_prompt(request)
+    prompt = build_ai_resolution_prompt(
+        request,
+        allow_web_research=allow_web_research,
+        allowed_sources=allowed_sources,
+    )
     try:
         raw_response = run_prompt_fn(
             prompt,

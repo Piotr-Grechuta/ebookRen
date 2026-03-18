@@ -1913,6 +1913,34 @@ class KodV3Tests(unittest.TestCase):
         self.assertEqual(best.cycle_source, "detail")
         self.assertEqual(best.genre, "fantasy, science fiction")
 
+    def test_pl_lubimyczytac_series_without_volume_is_marked_for_review(self) -> None:
+        meta = make_meta("Madrosc Swiata Czarownic", creators=["Andre Norton"])
+        online_candidates = [
+            kod_v3.OnlineCandidate(
+                "lubimyczytac",
+                "lubimyczytac:https://lubimyczytac.pl/ksiazka/129600/madrosc-swiata-czarownic",
+                "Madrosc Swiata Czarownic",
+                ["Andre Norton"],
+                [],
+                320,
+                "title-author-exact",
+                series="Swiat Czarownic",
+                volume=None,
+                genre="fantasy, science fiction",
+                cycle_source="detail",
+            )
+        ]
+
+        with mock.patch.object(kod_v3, "fetch_online_candidates", return_value=online_candidates):
+            record = kod_v3.infer_record(meta, use_online=True, providers=["lubimyczytac"], timeout=1.0, online_mode="PL")
+
+        self.assertEqual(record.author, "Norton Andre")
+        self.assertEqual(record.title, "Madrosc Swiata Czarownic")
+        self.assertEqual(record.series, "Swiat Czarownic")
+        self.assertIsNone(record.volume)
+        self.assertIn("seria-bez-tomu", record.review_reasons)
+        self.assertTrue(record.needs_review)
+
     def test_lubimyczytac_candidates_fallback_to_raw_category_when_mapping_is_unknown(self) -> None:
         meta = make_meta("Unknown Book", creators=["Author Example"])
         search_page = (

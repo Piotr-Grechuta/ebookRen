@@ -52,7 +52,9 @@ from models_core import (
 from runtime_config import (
     AI_AUTO_APPLY_CONFIDENCE,
     AI_CLI_TIMEOUT_SECONDS,
+    AI_ENABLE_WEB_RESEARCH,
     AI_REQUEST_CONFIDENCE_THRESHOLD,
+    AI_RESEARCH_SOURCES,
     AI_SANDBOX_MODE,
     ANNA_ARCHIVE_RE,
     APP_NAME,
@@ -1686,6 +1688,8 @@ def resolve_record_with_ai(
         auto_apply_confidence=AI_AUTO_APPLY_CONFIDENCE,
         timeout_seconds=AI_CLI_TIMEOUT_SECONDS,
         sandbox_mode=AI_SANDBOX_MODE,
+        allow_web_research=AI_ENABLE_WEB_RESEARCH,
+        allowed_sources=AI_RESEARCH_SOURCES,
         workdir=Path(__file__).resolve().parent,
     )
     return resolved_record, log_entry
