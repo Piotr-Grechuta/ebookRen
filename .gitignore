@@ -7,3 +7,4 @@ venv/
 online_cache*.json
 ebookren_processed.json
 *.zip
+author_patterns.csv.catalog-cache.pkl

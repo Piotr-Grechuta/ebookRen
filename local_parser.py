@@ -44,7 +44,7 @@ AUTHOR_BLOCKED_TOKENS = {
     "chronicles",
     "cykl",
     "ksiega",
-    "ksiÄ™ga",
+    "księga",
     "of",
     "part",
     "series",
@@ -110,7 +110,7 @@ COMMON_GIVEN_NAMES = {
     "wasilij",
     "william",
     "ake",
-    "ĂĄke",
+    "Ăke",
     "ahmed",
 }
 
@@ -247,6 +247,15 @@ def parse_hybrid_local(
         return HybridLocalParse()
 
     if " - " not in core and " -- " not in core and "," not in core:
+        full_author_match = resolve_substantial_author(core)
+        if full_author_match:
+            return HybridLocalParse(
+                title_hint="",
+                author_hint=clean_author_segment(full_author_match),
+                volume_hint=None,
+                source="hybrid:compact-author-only",
+                confidence=94,
+            )
         if split_known_author_prefix is not None:
             prefix_match = split_known_author_prefix(core)
             if prefix_match is not None and is_substantial_author_label(prefix_match[0]):

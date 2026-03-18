@@ -130,12 +130,20 @@ def iter_author_rows(page_html: str, *, page_number: int) -> Iterable[dict[str, 
         }
 
 
-def fetch_list_page(session: requests.Session, page_number: int, timeout: float, retries: int, sleep_seconds: float) -> str:
+def fetch_list_page(
+    session: requests.Session,
+    page_number: int,
+    timeout: float,
+    retries: int,
+    sleep_seconds: float,
+) -> tuple[int, str]:
     delay = max(sleep_seconds, 0.5)
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
             response = session.get(LIST_URL.format(page=page_number), timeout=timeout)
+            if response.status_code == 404:
+                return response.status_code, response.text
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After", "").strip()
                 if retry_after.isdigit():
@@ -146,7 +154,7 @@ def fetch_list_page(session: requests.Session, page_number: int, timeout: float,
                 last_error = requests.HTTPError(f"429 for page {page_number}", response=response)
                 continue
             response.raise_for_status()
-            return response.text
+            return response.status_code, response.text
         except requests.RequestException as exc:
             last_error = exc
             if attempt >= retries:
@@ -173,11 +181,57 @@ def write_rows(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def collect_author_rows(
+    *,
+    fetch_page,
+    start_page: int,
+    end_page: int | None,
+    max_pages_without_new_authors: int,
+    sleep_seconds: float = 0.0,
+) -> tuple[list[dict[str, str]], list[tuple[int, int, int, int]]]:
+    collected_rows: list[dict[str, str]] = []
+    seen_author_ids: set[str] = set()
+    page_stats: list[tuple[int, int, int, int]] = []
+    stale_pages = 0
+    page_number = start_page
+
+    while end_page is None or page_number <= end_page:
+        status_code, page_html = fetch_page(page_number)
+        if status_code == 404:
+            page_stats.append((page_number, status_code, 0, 0))
+            break
+        page_rows = list(iter_author_rows(page_html, page_number=page_number))
+        new_rows = 0
+        for row in page_rows:
+            author_id = row["source_author_id"]
+            if author_id in seen_author_ids:
+                continue
+            seen_author_ids.add(author_id)
+            collected_rows.append(row)
+            new_rows += 1
+        page_stats.append((page_number, status_code, len(page_rows), new_rows))
+        if end_page is None:
+            stale_pages = stale_pages + 1 if new_rows == 0 else 0
+            if stale_pages >= max_pages_without_new_authors:
+                break
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+        page_number += 1
+
+    return collected_rows, page_stats
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pobiera liste autorow z Lubimyczytac i zapisuje do CSV.")
     parser.add_argument("--output", default="author_patterns.csv", help="Sciezka do pliku wyjsciowego CSV.")
     parser.add_argument("--start-page", type=int, default=1, help="Pierwsza strona do pobrania.")
-    parser.add_argument("--end-page", type=int, default=100, help="Ostatnia strona do pobrania.")
+    parser.add_argument("--end-page", type=int, default=None, help="Opcjonalna ostatnia strona do pobrania.")
+    parser.add_argument(
+        "--max-pages-without-new-authors",
+        type=int,
+        default=2,
+        help="Po ilu kolejnych stronach bez nowych autorow zatrzymac crawl bez limitu koncowej strony.",
+    )
     parser.add_argument("--timeout", type=float, default=20.0, help="Timeout pojedynczego requestu.")
     parser.add_argument("--sleep", type=float, default=0.2, help="Odstep miedzy requestami do listy.")
     parser.add_argument("--retries", type=int, default=6, help="Liczba ponowien po 429 lub bledzie sieci.")
@@ -191,34 +245,26 @@ def main(argv: list[str] | None = None) -> int:
     session.headers.update({"User-Agent": "Mozilla/5.0"})
 
     preserved_rows = read_existing_non_lubimyczytac_rows(output_path)
-    collected_rows: list[dict[str, str]] = []
-    seen_author_ids: set[str] = set()
-    page_counts: list[tuple[int, int]] = []
-
-    for page_number in range(args.start_page, args.end_page + 1):
-        page_html = fetch_list_page(session, page_number, args.timeout, args.retries, args.sleep)
-        page_rows = list(iter_author_rows(page_html, page_number=page_number))
-        page_counts.append((page_number, len(page_rows)))
-        for row in page_rows:
-            author_id = row["source_author_id"]
-            if author_id in seen_author_ids:
-                continue
-            seen_author_ids.add(author_id)
-            collected_rows.append(row)
-        if args.sleep > 0:
-            time.sleep(args.sleep)
+    collected_rows, page_stats = collect_author_rows(
+        fetch_page=lambda page_number: fetch_list_page(session, page_number, args.timeout, args.retries, args.sleep),
+        start_page=args.start_page,
+        end_page=args.end_page,
+        max_pages_without_new_authors=args.max_pages_without_new_authors,
+        sleep_seconds=args.sleep,
+    )
 
     all_rows = collected_rows + preserved_rows
     write_rows(output_path, all_rows)
 
-    non_empty_pages = sum(1 for _, count in page_counts if count > 0)
+    non_empty_pages = sum(1 for _, _, count, _ in page_stats if count > 0)
     print(f"output={output_path}")
     print(f"lubimyczytac_rows={len(collected_rows)}")
     print(f"preserved_rows={len(preserved_rows)}")
-    print(f"pages_with_results={non_empty_pages}/{len(page_counts)}")
-    if page_counts:
-        print(f"page_1_rows={page_counts[0][1]}")
-        print(f"page_{page_counts[-1][0]}_rows={page_counts[-1][1]}")
+    print(f"pages_with_results={non_empty_pages}/{len(page_stats)}")
+    if page_stats:
+        print(f"page_{page_stats[0][0]}_rows={page_stats[0][2]}")
+        print(f"page_{page_stats[-1][0]}_status={page_stats[-1][1]}")
+        print(f"page_{page_stats[-1][0]}_rows={page_stats[-1][2]}")
     return 0
 
 

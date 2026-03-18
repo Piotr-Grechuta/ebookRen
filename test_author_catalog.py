@@ -51,6 +51,63 @@ class AuthorCatalogTests(unittest.TestCase):
         self.assertEqual(catalog.split_prefix("Aguirre Ann Enklawa"), ("Ann Aguirre", "Enklawa"))
         self.assertEqual(catalog.split_suffix("Enklawa Ann Aguirre"), ("Ann Aguirre", "Enklawa"))
 
+    def test_load_author_catalog_prefers_query_spelling_when_canonical_splits_surname(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "author_patterns.csv"
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "source": "lubimyczytac | openlibrary",
+                        "author_raw": "",
+                        "author_first_last": "Alfred Hitch Cock",
+                        "author_last_first": "Cock Alfred Hitch",
+                        "title_example": "Jak w komiksie",
+                        "language": "pl | en",
+                        "source_author_id": "lubimyczytac:1 | openlibrary:OL1A",
+                        "source_work_id": "",
+                        "source_url": "https://lubimyczytac.pl/autor/1/alfred-hitchcock | https://openlibrary.org/authors/OL1A",
+                        "confidence": "high",
+                        "notes": "test",
+                    }
+                )
+            catalog = author_catalog.load_author_catalog(path)
+
+        self.assertEqual(catalog.resolve("Alfred Hitchcock"), "Alfred Hitchcock")
+        self.assertEqual(catalog.resolve("Hitchcock Alfred"), "Alfred Hitchcock")
+        self.assertEqual(catalog.resolve_authors("Alfred Hitchcock"), ["Alfred Hitchcock"])
+
+    def test_load_author_catalog_writes_and_reuses_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "author_patterns.csv"
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "source": "lc",
+                        "author_raw": "",
+                        "author_first_last": "Ann Aguirre",
+                        "author_last_first": "Aguirre Ann",
+                        "title_example": "",
+                        "language": "",
+                        "source_author_id": "",
+                        "source_work_id": "",
+                        "source_url": "",
+                        "confidence": "high",
+                        "notes": "",
+                    }
+                )
+
+            first_catalog = author_catalog.load_author_catalog(path)
+            cache_path = path.with_name(f"{path.name}.catalog-cache.pkl")
+            self.assertTrue(cache_path.exists())
+            second_catalog = author_catalog.load_author_catalog(path)
+
+        self.assertEqual(first_catalog.resolve("Aguirre Ann"), "Ann Aguirre")
+        self.assertEqual(second_catalog.resolve("Aguirre Ann"), "Ann Aguirre")
+
     def test_load_author_catalog_resolves_multi_author_segments_with_noise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "author_patterns.csv"

@@ -100,6 +100,36 @@ class LocalParserTests(unittest.TestCase):
         self.assertEqual(parsed.title_hint, "Enklawa")
         self.assertEqual(parsed.source, "hybrid:compact-title-author")
 
+    def test_parse_hybrid_local_treats_full_known_author_as_author_only(self) -> None:
+        meta = type(
+            "Meta",
+            (),
+            {
+                "path": Path("x.epub"),
+                "stem": "Abagnale Frank W",
+                "segments": ["Abagnale Frank W"],
+                "core": "Abagnale Frank W",
+                "title": "",
+                "creators": [],
+                "identifiers": [],
+                "subjects": [],
+            },
+        )()
+
+        parsed = local_parser.parse_hybrid_local(
+            meta,
+            clean=infer_core.clean,
+            clean_author_segment=infer_core.clean,
+            looks_like_author_segment=lambda text: bool(text and any(char.isalpha() for char in text)),
+            strip_leading_title_index=infer_core.clean,
+            parse_volume_parts=infer_core.parse_volume_parts,
+            resolve_known_author=lambda text: "Frank W Abagnale" if infer_core.author_key(text or "") == infer_core.author_key("Abagnale Frank W") else "",
+        )
+
+        self.assertEqual(parsed.author_hint, "Frank W Abagnale")
+        self.assertEqual(parsed.title_hint, "")
+        self.assertEqual(parsed.source, "hybrid:compact-author-only")
+
     def test_parse_hybrid_local_uses_catalog_for_delimited_mixed_author_segment(self) -> None:
         meta = type(
             "Meta",
