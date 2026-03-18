@@ -9,6 +9,7 @@ def main() -> int:
         "",
         "",
         runtime.DEFAULT_ONLINE_MODE,
+        runtime.DEFAULT_AI_MODE,
         runtime.DEFAULT_PROVIDERS,
         runtime.DEFAULT_HTTP_TIMEOUT,
         0,

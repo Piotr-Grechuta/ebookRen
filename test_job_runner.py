@@ -219,6 +219,7 @@ class JobRunnerTests(unittest.TestCase):
                 destination_folder=None,
                 archive_folder=None,
                 online_mode="PL",
+                ai_mode="OFF",
                 apply_changes=True,
                 use_online=False,
                 providers=[],
@@ -230,6 +231,7 @@ class JobRunnerTests(unittest.TestCase):
                 is_supported_book_file=lambda path: path.suffix == ".epub",
                 read_book_metadata=lambda path: object(),
                 infer_record=lambda meta, **kwargs: DummyRecord(path=source, filename="source.epub"),
+                resolve_record_with_ai_fn=None,
                 write_book_metadata=lambda path, record: metadata_calls.append((path, record.filename)),
                 build_moves=lambda records, source_folder, target_folder, archive_folder, stamp: [],
                 execute_moves=lambda moves: [],
@@ -245,6 +247,81 @@ class JobRunnerTests(unittest.TestCase):
             self.assertEqual(metadata_calls, [(source, "source.epub")])
             self.assertIn("EMBEDDED_METADATA=ON", lines)
             self.assertIn("EMBEDDED_METADATA_WRITTEN=1", lines)
+
+    def test_run_job_logs_ai_resolution_results_in_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "source.epub"
+            source.write_text("x", encoding="utf-8")
+            reported_rows: list[DummyRecord] = []
+            resolved_modes: list[str] = []
+
+            def fake_resolve(record, meta, *, mode):
+                resolved_modes.append(mode)
+                updated = DummyRecord(
+                    path=record.path,
+                    filename="AI.epub",
+                    notes=list(record.notes) + ["ai-local:applied"],
+                    confidence=91,
+                    review_reasons=[],
+                    decision_reasons=list(record.decision_reasons) + ["ai-local:auto-applied"],
+                    author=record.author,
+                    series=record.series,
+                    volume=record.volume,
+                    title=record.title,
+                    genre=record.genre,
+                    source=f"{record.source}+ai-local",
+                    identifiers=list(record.identifiers),
+                    online_checked=record.online_checked,
+                    online_applied=record.online_applied,
+                    output_folder=record.output_folder,
+                    archive_source_path=record.archive_source_path,
+                )
+                return updated, {"path": str(record.path), "status": "applied", "mode": mode}
+
+            def capture_report(_path, rows, **_kwargs):
+                reported_rows.extend(rows)
+
+            code, lines = job_runner.run_job(
+                folder,
+                destination_folder=None,
+                archive_folder=None,
+                online_mode="PL",
+                ai_mode="AUTO",
+                apply_changes=False,
+                use_online=False,
+                providers=[],
+                timeout=1.0,
+                limit=0,
+                online_workers=1,
+                default_infer_workers=1,
+                online_http_slots=4,
+                is_supported_book_file=lambda path: path.suffix == ".epub",
+                read_book_metadata=lambda path: type("Meta", (), {"path": path, "stem": path.stem})(),
+                infer_record=lambda meta, **kwargs: DummyRecord(path=meta.path, filename="source.epub", confidence=55),
+                resolve_record_with_ai_fn=fake_resolve,
+                write_book_metadata=lambda path, record: None,
+                build_moves=lambda records, source_folder, target_folder, archive_folder, stamp: [],
+                execute_moves=lambda moves: [],
+                format_volume=lambda volume: "Tom 01.00",
+                write_report_fn=capture_report,
+                set_output_folder_fn=lambda records, folder: records,
+                dedupe_destinations_fn=lambda records, folder: records,
+                flush_online_cache_if_needed=lambda force=False: None,
+                write_epub_metadata=True,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(resolved_modes, ["AUTO"])
+            self.assertEqual(len(reported_rows), 1)
+            self.assertEqual(reported_rows[0].filename, "AI.epub")
+            self.assertIn("AI_MODE=AUTO", lines)
+            self.assertIn("AI_CASES=1", lines)
+            self.assertIn("AI_APPLIED=1", lines)
+            ai_log_line = next(line for line in lines if line.startswith("AI_LOG="))
+            ai_log_path = Path(ai_log_line.split("=", 1)[1])
+            self.assertTrue(ai_log_path.exists())
+            self.assertIn('"status": "applied"', ai_log_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

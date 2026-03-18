@@ -8,11 +8,13 @@ import ctypes
 import os
 import re
 import shutil
+from dataclasses import MISSING
 from ctypes import wintypes
 from pathlib import Path
 from typing import Callable, Iterable
 
 import author_catalog as author_catalog_mod
+import ai_resolver as ai_resolver_mod
 import cache_online as cache_online_mod
 import candidate_scorer as candidate_scorer_mod
 import domain_naming as domain_naming_mod
@@ -48,6 +50,10 @@ from models_core import (
     UndoPlan,
 )
 from runtime_config import (
+    AI_AUTO_APPLY_CONFIDENCE,
+    AI_CLI_TIMEOUT_SECONDS,
+    AI_REQUEST_CONFIDENCE_THRESHOLD,
+    AI_SANDBOX_MODE,
     ANNA_ARCHIVE_RE,
     APP_NAME,
     APP_VERSION,
@@ -58,6 +64,7 @@ from runtime_config import (
     CORE_JOINED_RE,
     CORE_SPACED_RE,
     CORE_TITLE_AUTHOR_RE,
+    DEFAULT_AI_MODE,
     DEFAULT_HTTP_TIMEOUT,
     DEFAULT_INFER_WORKERS,
     DEFAULT_ONLINE_MODE,
@@ -104,6 +111,7 @@ __all__ = [
     "APP_NAME",
     "APP_VERSION",
     "LocalPrototype",
+    "DEFAULT_AI_MODE",
     "DEFAULT_HTTP_TIMEOUT",
     "DEFAULT_INFER_WORKERS",
     "DEFAULT_ONLINE_MODE",
@@ -1633,7 +1641,12 @@ def infer_record(
 def make_record_clone(
     record: BookRecord,
     *,
+    author: str | None = None,
+    series: str | None = None,
+    volume: tuple[int, str] | None | object = MISSING,
     title: str | None = None,
+    source: str | None = None,
+    genre: str | None = None,
     notes: list[str] | None = None,
     confidence: int | None = None,
     review_reasons: list[str] | None = None,
@@ -1643,7 +1656,12 @@ def make_record_clone(
 ) -> BookRecord:
     return domain_naming_mod.make_record_clone(
         record,
+        author=author,
+        series=series,
+        volume=volume,
         title=title,
+        source=source,
+        genre=genre,
         notes=notes,
         confidence=confidence,
         review_reasons=review_reasons,
@@ -1651,6 +1669,26 @@ def make_record_clone(
         filename_suffix=filename_suffix,
         output_folder=output_folder,
     )
+
+
+def resolve_record_with_ai(
+    record: BookRecord,
+    meta: EpubMetadata,
+    *,
+    mode: str,
+) -> tuple[BookRecord, dict[str, object] | None]:
+    resolved_record, log_entry = ai_resolver_mod.resolve_record_with_ai(
+        record,
+        meta,
+        mode=mode,
+        make_record_clone=make_record_clone,
+        request_confidence_threshold=AI_REQUEST_CONFIDENCE_THRESHOLD,
+        auto_apply_confidence=AI_AUTO_APPLY_CONFIDENCE,
+        timeout_seconds=AI_CLI_TIMEOUT_SECONDS,
+        sandbox_mode=AI_SANDBOX_MODE,
+        workdir=Path(__file__).resolve().parent,
+    )
+    return resolved_record, log_entry
 
 
 def set_output_folder(records: list[BookRecord], folder: Path) -> list[BookRecord]:
@@ -1738,6 +1776,7 @@ def run_job(
     destination_folder: Path | None = None,
     archive_folder: Path | None = None,
     online_mode: str = DEFAULT_ONLINE_MODE,
+    ai_mode: str = DEFAULT_AI_MODE,
     apply_changes: bool,
     use_online: bool,
     providers: list[str],
@@ -1754,6 +1793,7 @@ def run_job(
         destination_folder=destination_folder,
         archive_folder=archive_folder,
         online_mode=online_mode,
+        ai_mode=ai_mode,
         apply_changes=apply_changes,
         use_online=use_online,
         providers=providers,
@@ -1765,6 +1805,7 @@ def run_job(
         is_supported_book_file=is_supported_book_file,
         read_book_metadata=read_book_metadata,
         infer_record=infer_record,
+        resolve_record_with_ai_fn=resolve_record_with_ai,
         write_book_metadata=write_book_metadata,
         build_moves=build_moves,
         execute_moves=execute_moves,

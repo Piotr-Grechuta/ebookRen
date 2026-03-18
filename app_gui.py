@@ -15,6 +15,7 @@ GUI_STATE_STRING_KEYS = (
     "destination_folder",
     "archive_folder",
     "online_mode",
+    "ai_mode",
     "metadata_folder",
     "metadata_tags",
     "conversion_source_folder",
@@ -74,6 +75,8 @@ def save_gui_state(**state_values: object) -> None:
 
     online_mode = str(payload.get("online_mode", "")).strip().upper()
     payload["online_mode"] = online_mode or runtime.DEFAULT_ONLINE_MODE
+    ai_mode = str(payload.get("ai_mode", "")).strip().upper()
+    payload["ai_mode"] = ai_mode or runtime.DEFAULT_AI_MODE
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -87,6 +90,7 @@ def launch_gui(
     default_destination: str,
     default_archive_folder: str,
     default_online_mode: str,
+    default_ai_mode: str,
     default_providers: str,
     default_timeout: float,
     default_limit: int,
@@ -108,6 +112,7 @@ def launch_gui(
     destination_var = tk.StringVar(value=saved_state.get("destination_folder") or default_destination)
     archive_var = tk.StringVar(value=saved_state.get("archive_folder") or default_archive_folder)
     online_mode_var = tk.StringVar(value=(saved_state.get("online_mode") or default_online_mode).upper())
+    ai_mode_var = tk.StringVar(value=(saved_state.get("ai_mode") or default_ai_mode).upper())
     timeout_var = tk.StringVar(value=str(default_timeout))
     limit_var = tk.StringVar(value=str(default_limit))
     online_workers_var = tk.StringVar(value=str(default_online_workers))
@@ -150,6 +155,7 @@ def launch_gui(
             destination_folder=destination_var.get(),
             archive_folder=archive_var.get(),
             online_mode=online_mode_var.get(),
+            ai_mode=ai_mode_var.get(),
             write_epub_metadata=write_epub_metadata_var.get(),
             metadata_folder=metadata_folder_var.get(),
             metadata_tags=metadata_tags_var.get(),
@@ -292,6 +298,7 @@ def launch_gui(
         skip_processed = skip_processed_var.get()
         write_epub_metadata = write_epub_metadata_var.get()
         online_mode = online_mode_var.get().strip().upper() or runtime.DEFAULT_ONLINE_MODE
+        ai_mode = ai_mode_var.get().strip().upper() or runtime.DEFAULT_AI_MODE
         persist_gui_state()
 
         start_background_task(
@@ -306,6 +313,7 @@ def launch_gui(
                 destination_folder=destination,
                 archive_folder=archive_folder,
                 online_mode=online_mode,
+                ai_mode=ai_mode,
                 apply_changes=apply_changes,
                 use_online=use_online,
                 providers=providers,
@@ -432,12 +440,22 @@ def launch_gui(
     ttk.Radiobutton(rename_options, text="PL", value="PL", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=5, sticky="w")
     ttk.Radiobutton(rename_options, text="PL+", value="PL+", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=6, sticky="w")
     ttk.Radiobutton(rename_options, text="EN", value="EN", variable=online_mode_var, command=persist_gui_state).grid(row=0, column=7, sticky="w")
-    ttk.Label(rename_options, text="Timeout").grid(row=0, column=8, sticky="w", padx=(20, 0))
-    ttk.Entry(rename_options, textvariable=timeout_var, width=8).grid(row=0, column=9, sticky="w")
-    ttk.Label(rename_options, text="Limit").grid(row=0, column=10, sticky="w", padx=(20, 0))
-    ttk.Entry(rename_options, textvariable=limit_var, width=8).grid(row=0, column=11, sticky="w")
-    ttk.Label(rename_options, text="Infer workers").grid(row=0, column=12, sticky="w", padx=(20, 0))
-    ttk.Entry(rename_options, textvariable=online_workers_var, width=8).grid(row=0, column=13, sticky="w")
+    ttk.Label(rename_options, text="Tryb AI").grid(row=0, column=8, sticky="w", padx=(20, 0))
+    ai_mode_combo = ttk.Combobox(
+        rename_options,
+        textvariable=ai_mode_var,
+        values=("OFF", "REVIEW", "ASSIST", "AUTO"),
+        state="readonly",
+        width=10,
+    )
+    ai_mode_combo.grid(row=0, column=9, sticky="w")
+    ai_mode_combo.bind("<<ComboboxSelected>>", lambda _event: persist_gui_state())
+    ttk.Label(rename_options, text="Timeout").grid(row=0, column=10, sticky="w", padx=(20, 0))
+    ttk.Entry(rename_options, textvariable=timeout_var, width=8).grid(row=0, column=11, sticky="w")
+    ttk.Label(rename_options, text="Limit").grid(row=0, column=12, sticky="w", padx=(20, 0))
+    ttk.Entry(rename_options, textvariable=limit_var, width=8).grid(row=0, column=13, sticky="w")
+    ttk.Label(rename_options, text="Infer workers").grid(row=0, column=14, sticky="w", padx=(20, 0))
+    ttk.Entry(rename_options, textvariable=online_workers_var, width=8).grid(row=0, column=15, sticky="w")
 
     rename_run_button = ttk.Button(rename_tab, text="Uruchom renamer", command=run_renamer_from_gui)
     rename_run_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0))

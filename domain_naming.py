@@ -607,7 +607,12 @@ def finalize_record_quality(
 def make_record_clone(
     record: BookRecord,
     *,
+    author: str | None = None,
+    series: str | None = None,
+    volume: tuple[int, str] | None | object = dataclasses.MISSING,
     title: str | None = None,
+    source: str | None = None,
+    genre: str | None = None,
     notes: list[str] | None = None,
     confidence: int | None = None,
     review_reasons: list[str] | None = None,
@@ -618,7 +623,12 @@ def make_record_clone(
 ) -> BookRecord:
     return dataclasses.replace(
         record,
+        author=author if author is not None else record.author,
+        series=series if series is not None else record.series,
+        volume=record.volume if volume is dataclasses.MISSING else volume,
         title=title if title is not None else record.title,
+        source=source if source is not None else record.source,
+        genre=genre if genre is not None else record.genre,
         notes=list(notes) if notes is not None else list(record.notes),
         confidence=record.confidence if confidence is None else confidence,
         review_reasons=list(review_reasons) if review_reasons is not None else list(record.review_reasons),

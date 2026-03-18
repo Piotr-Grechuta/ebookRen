@@ -20,6 +20,7 @@ MakeRecordClone: TypeAlias = Callable[..., RecordLike]
 FormatVolume: TypeAlias = Callable[[tuple[int, str] | None], str]
 ReadBookMetadata: TypeAlias = Callable[[Path], Any]
 InferRecord: TypeAlias = Callable[..., RecordLike]
+ResolveRecordWithAi: TypeAlias = Callable[..., tuple[RecordLike, dict[str, Any] | None]]
 BuildMoves: TypeAlias = Callable[[list[RecordLike], Path, Path, Path | None, str], list[Any]]
 ExecuteMoves: TypeAlias = Callable[[list[Any]], list[str]]
 WriteReportFn: TypeAlias = Callable[..., None]
@@ -312,6 +313,12 @@ def processed_file_key(path: Path) -> str:
     return path.name.lower()
 
 
+def write_jsonl_log(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def file_signature(path: Path) -> tuple[int, int]:
     stat = path.stat()
     return stat.st_size, stat.st_mtime_ns
@@ -526,9 +533,15 @@ def call_infer_record(
     emit_stage: Callable[[str, str], None] | None = None,
     emit_trace: Callable[[str], None] | None = None,
 ) -> RecordLike:
-    if emit_stage is None and emit_trace is None:
-        return infer_record(meta, use_online=use_online, providers=providers, timeout=timeout, online_mode=online_mode)
     try:
+        if emit_stage is None and emit_trace is None:
+            return infer_record(
+                meta,
+                use_online=use_online,
+                providers=providers,
+                timeout=timeout,
+                online_mode=online_mode,
+            )
         return infer_record(
             meta,
             use_online=use_online,
@@ -544,12 +557,26 @@ def call_infer_record(
         return infer_record(meta, use_online=use_online, providers=providers, timeout=timeout)
 
 
+def maybe_resolve_record_with_ai(
+    resolve_record_with_ai_fn: ResolveRecordWithAi | None,
+    record: RecordLike,
+    meta: Any,
+    *,
+    ai_mode: str,
+) -> tuple[RecordLike, dict[str, Any] | None]:
+    normalized_ai_mode = str(ai_mode or "").strip().upper()
+    if resolve_record_with_ai_fn is None or not normalized_ai_mode or normalized_ai_mode == "OFF":
+        return record, None
+    return resolve_record_with_ai_fn(record, meta, mode=normalized_ai_mode)
+
+
 def run_job(
     folder: Path,
     *,
     destination_folder: Path | None,
     archive_folder: Path | None,
     online_mode: str,
+    ai_mode: str,
     apply_changes: bool,
     use_online: bool,
     providers: list[str],
@@ -561,6 +588,7 @@ def run_job(
     is_supported_book_file: IsSupportedBookFile,
     read_book_metadata: ReadBookMetadata,
     infer_record: InferRecord,
+    resolve_record_with_ai_fn: ResolveRecordWithAi | None,
     write_book_metadata: WriteEmbeddedMetadata,
     build_moves: BuildMoves,
     execute_moves: ExecuteMoves,
@@ -632,8 +660,38 @@ def run_job(
     dry_run = not apply_changes
     report_name = "rename_books_preview" if dry_run else "rename_books_log"
     report_path = folder / f"{report_name}_{stamp}.csv"
+    normalized_ai_mode = str(ai_mode or "").strip().upper() or "OFF"
+    ai_log_path = folder / f"ai_resolution_log_{stamp}.jsonl"
+    ai_logs: list[dict[str, Any]] = []
     lines: list[str] = []
     lines.extend(manifest_progress_lines)
+
+    def remember_ai_log(
+        log_entry: dict[str, Any] | None,
+        *,
+        path: Path | None = None,
+        index: int = 0,
+        total: int = 0,
+    ) -> None:
+        if log_entry is None:
+            return
+        ai_logs.append(log_entry)
+        if emit_progress is not None and path is not None and total > 0:
+            emit_file_progress(
+                emit_progress,
+                path=path,
+                index=index,
+                total=total,
+                stage="ai",
+                detail=f"status={log_entry.get('status', 'queued')}",
+            )
+
+    def finalize_ai_logs() -> tuple[int, int]:
+        if ai_logs:
+            write_jsonl_log(ai_log_path, ai_logs)
+        ai_applied = sum(1 for entry in ai_logs if entry.get("status") == "applied")
+        ai_errors = sum(1 for entry in ai_logs if entry.get("status") == "error")
+        return ai_applied, ai_errors
 
     if apply_changes:
         infer_workers = 1
@@ -675,6 +733,13 @@ def run_job(
                 emit_stage=make_stage_emitter(emit_progress, path=path, index=index, total=len(files)),
                 emit_trace=emit_trace,
             )
+            record, ai_log = maybe_resolve_record_with_ai(
+                resolve_record_with_ai_fn,
+                record,
+                meta,
+                ai_mode=normalized_ai_mode,
+            )
+            remember_ai_log(ai_log, path=path, index=index, total=len(files))
             infer_ms += int((time.perf_counter() - infer_started_at) * 1000)
             source_signatures[record.path.resolve()] = file_signature(record.path)
 
@@ -758,6 +823,7 @@ def run_job(
             execution_status=execution_status,
             embedded_metadata_status=embedded_metadata_status,
         )
+        ai_applied, ai_errors = finalize_ai_logs()
         review_total = sum(1 for record in records if record.needs_review)
         lines.append(
             f"TOTAL={len(records)} | SKIPPED={len(skipped_files)} | TO_WRITE={to_write} | WRITTEN={written_total} | REVIEW={review_total} | ERRORS={len(errors)}"
@@ -774,6 +840,11 @@ def run_job(
                 f"ONLINE_HTTP_SLOTS={online_http_slots}",
                 f"TO_WRITE={to_write}",
                 f"WRITTEN={written_total}",
+                f"AI_MODE={normalized_ai_mode}",
+                f"AI_CASES={len(ai_logs)}",
+                f"AI_APPLIED={ai_applied}",
+                f"AI_ERRORS={ai_errors}",
+                f"AI_LOG={ai_log_path if ai_logs else ''}",
                 f"EMBEDDED_METADATA={'ON' if write_epub_metadata else 'OFF'}",
                 f"EMBEDDED_METADATA_WRITTEN={metadata_written_total}",
                 f"METADATA_ERRORS={len(metadata_errors)}",
@@ -826,6 +897,13 @@ def run_job(
                 emit_stage=make_stage_emitter(emit_progress, path=meta.path, index=index, total=len(metas)),
                 emit_trace=emit_trace,
             )
+            record, ai_log = maybe_resolve_record_with_ai(
+                resolve_record_with_ai_fn,
+                record,
+                meta,
+                ai_mode=normalized_ai_mode,
+            )
+            remember_ai_log(ai_log, path=meta.path, index=index, total=len(metas))
             record.output_folder = target_folder
             record = dedupe_destinations_fn([record], target_folder)[0]
             assign_archive_source_paths([record], archive_folder)
@@ -853,13 +931,29 @@ def run_job(
         records_by_index: list[RecordLike | None] = [None] * len(metas)
         with ThreadPoolExecutor(max_workers=infer_workers) as executor:
             future_to_index = {
-                executor.submit(infer_record, meta, use_online=use_online, providers=providers, timeout=timeout): index
+                executor.submit(
+                    call_infer_record,
+                    infer_record,
+                    meta,
+                    use_online=use_online,
+                    providers=providers,
+                    timeout=timeout,
+                    online_mode=online_mode,
+                ): index
                 for index, meta in enumerate(metas)
             }
             completed_records = 0
             for future in as_completed(future_to_index):
                 index = future_to_index[future]
                 record = future.result()
+                meta = metas[index]
+                record, ai_log = maybe_resolve_record_with_ai(
+                    resolve_record_with_ai_fn,
+                    record,
+                    meta,
+                    ai_mode=normalized_ai_mode,
+                )
+                remember_ai_log(ai_log)
                 record.output_folder = target_folder
                 record = dedupe_destinations_fn([record], target_folder)[0]
                 assign_archive_source_paths([record], archive_folder)
@@ -906,6 +1000,7 @@ def run_job(
             execution_status=execution_status,
             embedded_metadata_status=embedded_metadata_status,
         )
+        ai_applied, ai_errors = finalize_ai_logs()
         to_write = len(build_moves(records, folder, target_folder, archive_folder, stamp))
         review_count = sum(1 for record in records if record.needs_review)
         lines.append(f"TOTAL={len(records)} | SKIPPED={len(skipped_files)} | REVIEW={review_count} | TO_WRITE={to_write}")
@@ -920,6 +1015,11 @@ def run_job(
                 f"SKIPPED={len(skipped_files)}",
                 f"INFER_WORKERS={infer_workers}",
                 f"ONLINE_HTTP_SLOTS={online_http_slots}",
+                f"AI_MODE={normalized_ai_mode}",
+                f"AI_CASES={len(ai_logs)}",
+                f"AI_APPLIED={ai_applied}",
+                f"AI_ERRORS={ai_errors}",
+                f"AI_LOG={ai_log_path if ai_logs else ''}",
                 f"EMBEDDED_METADATA={'ON' if write_epub_metadata else 'OFF'}",
                 f"REVIEW={review_count}",
                 f"REPORT={report_path}",
@@ -978,6 +1078,7 @@ def run_job(
         execution_status=execution_status,
         embedded_metadata_status=embedded_metadata_status,
     )
+    ai_applied, ai_errors = finalize_ai_logs()
     review_total = sum(1 for record in records if record.needs_review)
     written_total = len(moves) if not move_execution_failed else 0
     if not move_execution_failed:
@@ -1013,6 +1114,11 @@ def run_job(
             f"ONLINE_HTTP_SLOTS={online_http_slots}",
             f"TO_WRITE={len(moves)}",
             f"WRITTEN={written_total}",
+            f"AI_MODE={normalized_ai_mode}",
+            f"AI_CASES={len(ai_logs)}",
+            f"AI_APPLIED={ai_applied}",
+            f"AI_ERRORS={ai_errors}",
+            f"AI_LOG={ai_log_path if ai_logs else ''}",
             f"EMBEDDED_METADATA={'ON' if write_epub_metadata else 'OFF'}",
             f"EMBEDDED_METADATA_WRITTEN={metadata_written_total}",
             f"METADATA_ERRORS={len(metadata_errors)}",
